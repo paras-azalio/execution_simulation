@@ -1,0 +1,17 @@
+{
+  "name": "execution-simulation",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Interactive MOP generator - the browser-side engine, walk and page",
+  "scripts": {
+    "test": "node test_engine_js.js && node test_page_dom.js && node test_runner_dom.js",
+    "test:pages": "node test_page_dom.js --all out/all",
+    "build": "python build_runner.py"
+  },
+  "devDependencies": {
+    "jsdom": "^27.0.0"
+  },
+  "dependencies": {
+    "js-yaml": "^5.4.2"
+  }
+}

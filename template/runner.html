@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CLICR runner</title>
+<style>
+{{UI_CSS}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>CLICR runner</h1>
+  <div class="sub">Drop a workflow, a CIQ and the json-output mapping, pick a node,
+    and walk the activity command by command - marking each one Success, Failure,
+    or pasting what the node actually printed. Nothing leaves this page.</div>
+
+  <div class="card" id="loader">
+    <h2 data-toggle="loaderBody"><span class="grow">Inputs</span>
+      <span class="k" id="loaderState">nothing loaded</span></h2>
+    <div class="body" id="loaderBody">
+      <div class="drop" id="dropzone">
+        <h3>Drop the files here</h3>
+        <span class="k">or pick them below. A <code>.json</code> is taken as the CIQ,
+          a <code>*_json-output.yaml</code> as the mapping, any other
+          <code>.yaml</code> as the workflow.</span>
+        <div class="grid">
+          <div>
+            <label class="f">Workflow YAML <span class="k">(required)</span></label>
+            <input type="file" id="fileWorkflow" accept=".yaml,.yml">
+            <div class="file" id="nameWorkflow">none</div>
+          </div>
+          <div>
+            <label class="f">CIQ JSON <span class="k">(required)</span></label>
+            <input type="file" id="fileCiq" accept=".json">
+            <div class="file" id="nameCiq">none</div>
+          </div>
+          <div>
+            <label class="f">json-output mapping <span class="k">(optional)</span></label>
+            <input type="file" id="fileMapping" accept=".yaml,.yml">
+            <div class="file" id="nameMapping">none</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid" style="margin-top:10px">
+        <div>
+          <label class="f">Node</label>
+          <select id="nodePick" disabled><option>load a CIQ first</option></select>
+        </div>
+        <div>
+          <label class="f">&nbsp;</label>
+          <button id="btnExpand2" class="primary" disabled>Expand</button>
+        </div>
+      </div>
+
+      <div id="notes"></div>
+    </div>
+  </div>
+
+  <div id="app"></div>
+</div>
+
+<script>
+/* ===================================================================== *
+ *  js-yaml (vendored, unmodified) - the page has to read a workflow, and
+ *  it has to work opened from disk with no network.
+ * ===================================================================== */
+{{JSYAML}}
+
+/* ===================================================================== *
+ *  The engine, the synthesiser, the walk, the lenient loader and the
+ *  renderer - the same files test_expander_parity.py checks against
+ *  expander.py over every workflow in the repo.
+ * ===================================================================== */
+{{ENGINE_JS}}
+
+{{SYNTH_JS}}
+
+{{EXPANDER_JS}}
+
+{{YAMLLOAD_JS}}
+
+{{UI_JS}}
+
+/* ===================================================================== *
+ *  The loader
+ * ===================================================================== */
+(function () {
+  const input = { workflow: null, ciq: null, mapping: null };
+  const text = { workflow: "", ciq: "", mapping: "" };
+  const name = { workflow: "", ciq: "", mapping: "" };
+  let data = null, notes = [], nodes = [];
+
+  const $ = id => document.getElementById(id);
+  const esc = s => String(s === undefined || s === null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+  function say(kind, message) { notes.push({ kind: kind, message: message }); }
+
+  function paintNotes() {
+    $("notes").innerHTML = notes.map(n =>
+      '<div class="' + (n.kind === "error" ? "err" : "note") + '">' + esc(n.message) + '</div>'
+    ).join("");
+  }
+
+  function paintNames() {
+    for (const slot of ["workflow", "ciq", "mapping"]) {
+      const el = $("name" + slot.charAt(0).toUpperCase() + slot.slice(1));
+      el.textContent = name[slot] || "none";
+      el.parentElement.parentElement.classList.toggle("empty", !name[slot]);
+    }
+    const ready = !!(text.workflow && text.ciq);
+    $("btnExpand2").disabled = !ready || !nodes.length;
+    $("loaderState").textContent = ready
+      ? (nodes.length ? nodes.length + " node" + (nodes.length === 1 ? "" : "s") + " ready"
+                      : "no node in the CIQ")
+      : "workflow and CIQ needed";
+  }
+
+  /** Which slot a dropped file belongs in. */
+  function slotFor(file) {
+    const lower = file.name.toLowerCase();
+    if (lower.endsWith(".json")) return "ciq";
+    if (lower.indexOf("json-output") >= 0) return "mapping";
+    if (lower.endsWith(".yaml") || lower.endsWith(".yml")) return "workflow";
+    return null;
+  }
+
+  function read(file, slot) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      text[slot] = String(reader.result);
+      name[slot] = file.name;
+      notes = [];
+      if (slot === "ciq") loadCiq();
+      if (slot === "workflow") checkWorkflow();
+      paintNames();
+      paintNotes();
+    };
+    reader.onerror = () => {
+      say("error", "could not read " + file.name);
+      paintNotes();
+    };
+    reader.readAsText(file);
+  }
+
+  function loadCiq() {
+    try {
+      data = normalizeCiq(JSON.parse(text.ciq));
+    } catch (e) {
+      data = null;
+      say("error", name.ciq + " is not valid JSON: " + e.message);
+    }
+    nodes = (data && data.nodes) || [];
+    const pick = $("nodePick");
+    if (!nodes.length) {
+      pick.innerHTML = '<option>no nodes in this CIQ</option>';
+      pick.disabled = true;
+      if (data) {
+        say("error", "this CIQ has no nodes. A v2 CIQ carries nodeGroups[].nodes[]; " +
+                     "a v1 one carries nodes[] at the root.");
+      }
+      return;
+    }
+    pick.innerHTML = nodes.map((n, i) =>
+      '<option value="' + i + '">' + esc(n.node || n.nodeGroup || ("node " + (i + 1))) +
+      (n.crGroup ? " · " + esc(n.crGroup) : "") + '</option>').join("");
+    pick.disabled = false;
+  }
+
+  /** Report what the lenient loader had to forgive, before it matters. */
+  function checkWorkflow() {
+    for (const note of duplicateKeys(text.workflow)) {
+      say("note", name.workflow + " " + note);
+    }
+  }
+
+  function expand() {
+    notes = notes.filter(n => n.kind === "note");
+    let workflow, mapping = null;
+    try {
+      const loaded = loadWorkflow(jsyaml, text.workflow);
+      workflow = loaded.doc;
+      for (const note of loaded.notes) say("note", name.workflow + " " + note);
+    } catch (e) {
+      say("error", "could not read " + name.workflow + ":\n" + (e.message || e));
+      paintNotes();
+      return;
+    }
+    if (!workflow || !workflow.phases) {
+      say("error", name.workflow + " has no `phases:` block - is it a workflow?");
+      paintNotes();
+      return;
+    }
+    if (text.mapping) {
+      try {
+        mapping = new OutputTemplate(loadWorkflow(jsyaml, text.mapping).doc, name.mapping);
+      } catch (e) {
+        say("note", "ignoring " + name.mapping + ": " + (e.message || e));
+      }
+    }
+
+    const index = parseInt($("nodePick").value || "0", 10);
+    const node = nodes[index];
+    const params = Object.assign({}, DEFAULT_PARAMS);
+    let expansion;
+    try {
+      expansion = new Expander(workflow, data, params, mapping).expand(node);
+    } catch (e) {
+      say("error", "the workflow could not be walked:\n" + (e.stack || e.message || e));
+      paintNotes();
+      return;
+    }
+
+    for (const warning of expansion.warnings) say("note", warning);
+    if (!expansion.steps.length) {
+      say("error", "the walk produced no steps. Every phase was gated off, or the " +
+                   "loops found nothing in this CIQ to iterate.");
+    }
+    paintNotes();
+
+    const meta = Object.assign({}, expansion.node, {
+      generated: new Date().toISOString().slice(0, 19).replace("T", " "),
+      workflow: name.workflow, ciq: name.ciq, mapping: name.mapping || null,
+      steps: expansion.steps.length,
+    });
+
+    document.getElementById("app").innerHTML = "";
+    initDocument({
+      mount: document.getElementById("app"),
+      meta: meta,
+      steps: expansion.steps,
+      vars: expansion.vars,
+      globals: new Expander(workflow, data, params, mapping).globalsVars(),
+      params: params,
+      storageKey: "execflow:runner:" + (meta.activity || name.workflow) + ":" + meta.node,
+    });
+    document.getElementById("app").scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  /* -- wiring ------------------------------------------------------- */
+  for (const [id, slot] of [["fileWorkflow", "workflow"], ["fileCiq", "ciq"],
+                            ["fileMapping", "mapping"]]) {
+    $(id).addEventListener("change", e => {
+      const file = e.target.files && e.target.files[0];
+      if (file) read(file, slot);
+    });
+  }
+
+  const zone = $("dropzone");
+  zone.addEventListener("dragover", e => { e.preventDefault(); zone.classList.add("over"); });
+  zone.addEventListener("dragleave", () => zone.classList.remove("over"));
+  zone.addEventListener("drop", e => {
+    e.preventDefault();
+    zone.classList.remove("over");
+    for (const file of Array.from(e.dataTransfer.files || [])) {
+      const slot = slotFor(file);
+      if (slot) read(file, slot);
+      else { say("note", "ignored " + file.name + " - not a .yaml or .json"); paintNotes(); }
+    }
+  });
+
+  $("btnExpand2").addEventListener("click", expand);
+  $("nodePick").addEventListener("change", () => {
+    if (document.getElementById("app").innerHTML) expand();
+  });
+  document.querySelectorAll("[data-toggle]").forEach(h => {
+    h.onclick = e => {
+      if (e.target.tagName === "BUTTON") return;
+      const el = document.getElementById(h.getAttribute("data-toggle"));
+      if (el) el.classList.toggle("hidden");
+    };
+  });
+
+  paintNames();
+})();
+</script>
+</body>
+</html>

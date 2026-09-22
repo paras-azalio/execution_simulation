@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{TITLE}}</title>
+<style>
+{{UI_CSS}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>{{TITLE}}</h1>
+  <div class="sub" id="subline">{{SUBTITLE}}</div>
+  <div id="app"></div>
+</div>
+
+<script>
+/* ===================================================================== *
+ *  Data, emitted by mopgen.py
+ * ===================================================================== */
+const META    = {{META_JSON}};
+const STEPS   = {{STEPS_JSON}};
+const VARS0   = {{VARS_JSON}};
+const GLOBALS = {{GLOBALS_JSON}};   /* globals.vars as [name, raw], in order */
+const PARAMS  = {{PARAMS_JSON}};
+
+/* ===================================================================== *
+ *  Engine mirror - ExecutionContext semantics, in the browser.
+ *  Ported from execution_simulation/engine.py, which is itself ported from
+ *  ExecutionContext.java. Same quirks on purpose:
+ *    - an unresolved ${...} becomes an EMPTY STRING
+ *    - || splits before &&, and there are NO parentheses
+ *    - == is case sensitive
+ * ===================================================================== */
+{{ENGINE_JS}}
+
+/* ===================================================================== *
+ *  The document - the same renderer runner.html uses, so a MOP generated
+ *  on the command line and a workflow dropped into the runner behave
+ *  identically.
+ * ===================================================================== */
+{{UI_JS}}
+
+initDocument({
+  mount:   document.getElementById("app"),
+  meta:    META,
+  steps:   STEPS,
+  vars:    VARS0,
+  globals: GLOBALS,
+  params:  PARAMS,
+});
+</script>
+</body>
+</html>

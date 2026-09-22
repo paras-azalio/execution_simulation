@@ -1,0 +1,27 @@
+# Dependencies. Restored by `npm install` from package-lock.json, which IS
+# committed. The one third-party file the build needs at rest is
+# template/vendor/js-yaml.umd.min.js - it is vendored on purpose, because the
+# runner has to be buildable with no network, so it is NOT ignored.
+node_modules/
+
+# Generated documents: MOPs, the synthesised CIQs, the built runner, the index.
+# All of it comes back from `python runall.py` and `python build_runner.py`.
+out/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test scratch. The suites write into the system temp directory, but a failed
+# run can leave one of these behind.
+execflow_*/
+parity_*/
+
+# Editors and operating systems
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
