@@ -125,10 +125,25 @@ function pillOf(p, uid) {
 
 function steps(p) {
   return JSON.parse(p.window.eval(
-    "JSON.stringify(STEPS.map(s=>({uid:s.uid,seq:s.seq,phase:s.phase," +
+    "JSON.stringify(STEPS.map(s=>({uid:s.uid,seq:s.seq,phase:s.phase,kind:s.kind," +
     "mode:s.render_mode,of:s.on_failure,register:s.register||[]," +
+    "loops:(s.loop_path||[]).map(l=>l.loop)," +
+    "warnish:!!((s.validation||{}).hasWarningBranch)||(s.on_failure||{}).mode==='warning'," +
+    "failVars:Object.keys(((s.validation||{}).branchVars||{}).failure||{})," +
     "ok:s.success_output||'',bad:s.failure_output||'',crit:" +
     "((s.validation||{}).successCriteria)||{}})))"));
+}
+
+function tables(p) {
+  return JSON.parse(p.window.eval("JSON.stringify({phases: PHASES, loops: Object.keys(LOOPS)" +
+    ".reduce((o,k)=>{o[k]={on_failure:LOOPS[k].on_failure};return o;},{})})"));
+}
+
+/** A step's failure halts the rest of the run - it is not absorbed by a loop
+ *  whose on_failure is continue, and its own on_failure is plain stop. */
+function haltsTheRun(step, loops) {
+  if ((step.of || {}).mode !== "stop") return false;
+  return step.loops.every(l => (loops[l] || {}).on_failure === "stop");
 }
 
 function storageOf(p) {
@@ -206,7 +221,12 @@ function run(htmlPath) {
   const html = fs.readFileSync(htmlPath, "utf8");
   const p = openPage(html);
   const all = steps(p);
+  const T = tables(p);
+  const PH = {};
+  for (const ph of T.phases) PH[ph.key] = ph;
   const interactive = all.filter(s => s.mode === "interactive");
+  // FAILURE, or WARNING where the step turns a failure into a warning
+  const failed = (s, got) => got === "FAILURE" || (s.warnish && got === "WARNING");
 
   /* -- it renders at all ------------------------------------------- */
   ok("page renders phase cards", q(p, "#phases .card").length > 0);
@@ -249,7 +269,8 @@ function run(htmlPath) {
     click(p, checkStep.uid, "success");
     eq("checklist OK marks the row SUCCESS", pillOf(p, checkStep.uid), "SUCCESS");
     click(p, checkStep.uid, "failure");
-    eq("checklist NOK marks the row FAILURE", pillOf(p, checkStep.uid), "FAILURE");
+    ok("checklist NOK marks the row FAILURE (or WARNING where on_failure says so)",
+       failed(checkStep, pillOf(p, checkStep.uid)), pillOf(p, checkStep.uid));
     clearStep(p, checkStep);
   }
 
@@ -265,23 +286,32 @@ function run(htmlPath) {
     const ta = p.document.querySelector('[data-custom="' + badStep.uid + '"]');
     ta.value = badStep.bad;
     ta.dispatchEvent(new p.window.Event("change"));
-    eq("pasted failure output evaluates to FAILURE", pillOf(p, badStep.uid), "FAILURE");
+    ok("pasted failure output evaluates to FAILURE (or WARNING on a warning branch)",
+       failed(badStep, pillOf(p, badStep.uid)), pillOf(p, badStep.uid));
     click(p, badStep.uid, "pending");
   }
 
   /* -- Failure routing ---------------------------------------------- */
-  const stopIdx = all.findIndex((s, i) => i < all.length - 1 &&
-                                (s.of || {}).mode === "stop" &&
-                                pillOf(p, s.uid) === "pending");
+  // ExecutionOrchestrator: after a stop the rest of that phase is not
+  // executed, and neither is any later phase - except a rollback phase (or
+  // one declaring then:), which still runs if its own when is true.
+  const stopIdx = all.findIndex((s, i) => i < all.length - 1 && !s.warnish &&
+                                haltsTheRun(s, T.loops) && pillOf(p, s.uid) === "pending" &&
+                                all.slice(i + 1).some(o => o.phase === s.phase));
   if (stopIdx < 0) {
-    skip("on_failure: stop", "no stop-on-failure step with steps after it");
+    skip("on_failure: stop", "no stop-on-failure step that halts the run with steps after it");
   } else {
     const stop = all[stopIdx];
     click(p, stop.uid, "failure");
     eq("Failure marks the step FAILURE", pillOf(p, stop.uid), "FAILURE");
     const after = all.slice(stopIdx + 1);
-    eq("every later step is NOT EXECUTED",
-       after.filter(s => pillOf(p, s.uid) === "NOT EXECUTED").length, after.length);
+    const phaseContinues = (PH[stop.phase] || {}).on_failure === "continue";
+    const halted = after.filter(s => s.phase === stop.phase ||
+                                     (!phaseContinues && !(PH[s.phase] || {}).post_failure));
+    eq("every later step of that phase and of later non-rollback phases is NOT EXECUTED",
+       halted.filter(s => pillOf(p, s.uid) === "NOT EXECUTED").length, halted.length);
+    const banner = p.document.querySelector("#banners .banner.bad");
+    ok("a banner says where the run stops", !!banner && /stops at/.test(banner.textContent));
     clearStep(p, stop);
     ok("clearing the failure revives the later steps",
        after.every(s => pillOf(p, s.uid) !== "NOT EXECUTED"));
@@ -289,15 +319,61 @@ function run(htmlPath) {
 
   const contStep = all.find((s, i) => i < all.length - 1 &&
                             ["continue", "warning"].indexOf((s.of || {}).mode) >= 0 &&
-                            pillOf(p, s.uid) === "pending");
+                            pillOf(p, s.uid) === "pending" &&
+                            all.slice(i + 1).some(o => o.phase === s.phase));
   if (!contStep) {
     skip("on_failure: continue", "no continue-on-failure step");
   } else {
     const idx = all.indexOf(contStep);
     click(p, contStep.uid, "failure");
-    ok("on_failure: " + contStep.of.mode + " does not halt the rest",
-       all.slice(idx + 1).every(s => pillOf(p, s.uid) !== "NOT EXECUTED"));
+    ok("on_failure: " + contStep.of.mode + " does not halt the rest of its phase",
+       all.slice(idx + 1).filter(s => s.phase === contStep.phase)
+          .every(s => pillOf(p, s.uid) !== "NOT EXECUTED"));
     clearStep(p, contStep);
+  }
+
+  /* -- a failure that asks for rollback gets it ---------------------- */
+  const rollbackPhases = T.phases.filter(ph => ph.post_failure && /ROLLBACK_REQUIRED/.test(ph.when || ""));
+  // (a step with on_failure run: handlers is no probe: a DSR 401 runs a retry
+  // whose success sets ROLLBACK_REQUIRED back to false - correctly)
+  const asks = all.find(s => s.failVars.indexOf("ROLLBACK_REQUIRED") >= 0 && !s.warnish &&
+                             (s.of || {}).mode !== "run" && pillOf(p, s.uid) === "pending" &&
+                             !rollbackPhases.some(ph => ph.key === s.phase));
+  if (!rollbackPhases.length || !asks) {
+    skip("rollback after a failure", "no rollback phase gated on ROLLBACK_REQUIRED, or no step sets it on failure");
+  } else {
+    const rb = all.filter(s => rollbackPhases.some(ph => ph.key === s.phase));
+    ok("rollback is skipped on the happy path",
+       rb.every(s => pillOf(p, s.uid) === "SKIPPED"), rb.map(s => pillOf(p, s.uid)).join(","));
+    click(p, asks.uid, "failure");
+    const pill = pillOf(p, asks.uid);
+    if (pill === "FAILURE") {
+      // the phase gate opens; its own loops and steps may still gate
+      // themselves off (SBC_127's rollback loops wait for CREATE_MGW)
+      const gated = s => {
+        const card = p.document.getElementById("c" + s.uid);
+        return !!card && Array.from(card.querySelectorAll(".note"))
+          .some(n => /^phase \S+ when is false/.test(n.textContent));
+      };
+      ok("a failure whose branch sets ROLLBACK_REQUIRED opens the rollback phase gate",
+         rb.every(s => !gated(s)),
+         "rollback pills: " + Array.from(new Set(rb.map(s => pillOf(p, s.uid)))).join(","));
+    } else {
+      skip("rollback after a failure", "the probe step did not fail (" + pill + ")");
+    }
+    clearStep(p, asks);
+  }
+
+  /* -- REST steps take a status, not an exit code --------------------- */
+  const restStep = all.find(s => s.kind === "rest" && s.mode === "interactive" && pillOf(p, s.uid) === "pending");
+  if (!restStep) {
+    skip("REST custom input", "no REST step");
+  } else {
+    click(p, restStep.uid, "custom");
+    ok("a REST step's Custom input asks for an HTTP status",
+       !!p.document.querySelector('[data-status="' + restStep.uid + '"]'));
+    ok("and not for an exit code", !p.document.querySelector('[data-exit="' + restStep.uid + '"]'));
+    click(p, restStep.uid, "pending");
   }
 
   /* -- toolbar ------------------------------------------------------ */
@@ -450,26 +526,33 @@ function run(htmlPath) {
   const chosen = all.find(s => pillOf(p, s.uid) === "pending");
   if (chosen) click(p, chosen.uid, "success");
   byId(p, "btnExport").click();
-  if (!ok("Export produced a blob", p.exports.length === 1)) {
-    return finish(p, all, html, chosen);
+  byId(p, "btnReport").click();
+  byId(p, "btnSave").click();
+  if (!ok("Export, report and save each produced a file", p.exports.length === 3,
+          "got " + p.exports.length)) {
+    return finish(p, all, html, chosen, null);
   }
-  return blobText(p, p.exports[0]).then(text => {
+  return Promise.all(p.exports.map(b => blobText(p, b))).then(([text, report, saved]) => {
     let doc = null;
     try { doc = JSON.parse(text); } catch (e) { /* reported next */ }
     if (ok("exported JSON parses", !!doc)) {
       eq("export carries every step", (doc.steps || []).length, all.length);
       ok("export carries the node meta", !!(doc.node && doc.node.node));
       ok("export carries the final variables", !!doc.finalVariables);
+      ok("export carries the summary and the engine variables",
+         !!(doc.summary && doc.summary.engine && "ROLLBACK_ENABLED" in doc.summary.engine));
       if (chosen) {
         ok("export records the choice that was made",
            (doc.steps || []).some(s => s.choice === "success"));
       }
     }
-    return finish(p, all, html, chosen);
+    ok("the report is a standalone HTML page", /^<!DOCTYPE html>/.test(report) && /Execution log/.test(report));
+    ok("the saved copy carries the walk", saved.indexOf("<script type=\"application/json\" id=\"execflow-seed\">{") >= 0);
+    return finish(p, all, html, chosen, saved);
   });
 }
 
-function finish(p, all, html, chosen) {
+function finish(p, all, html, chosen, savedCopy) {
   /* -- resume across a reload --------------------------------------- */
   const saved = storageOf(p);
   ok("the run state was persisted",
@@ -483,6 +566,16 @@ function finish(p, all, html, chosen) {
     eq("a reload resumes the recorded choice", pillOf(p2, chosen.uid), pillOf(p, chosen.uid));
     ok("the resumed choice still shows as chosen",
        /\bon\b/.test((setBtn(p2, chosen.uid, "success") || {}).className || ""));
+  }
+
+  /* -- a saved walked copy reopens as it was saved, on a clean machine -- */
+  if (savedCopy && chosen) {
+    const p3 = openPage(savedCopy);
+    eq("a saved copy reopens with the walk it was saved with", pillOf(p3, chosen.uid), pillOf(p, chosen.uid));
+    eq("no page errors in the saved copy", p3.errors.length, 0);
+    p3.window.close();
+  } else {
+    skip("saved copy", "nothing was saved or chosen");
   }
 
   /* -- reset -------------------------------------------------------- */

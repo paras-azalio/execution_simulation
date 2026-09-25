@@ -217,7 +217,7 @@ function ciqField(token) {
  *   ${A == "x" || B == "y"}        -> first clause only
  *   ${LDAPFIELDS != ""}            -> {} (not derivable)
  */
-function impliedValues(criteria, vars, firstClauseOnly) {
+function impliedValues(criteria, vars, firstClauseOnly, owned) {
   if (firstClauseOnly === undefined) firstClauseOnly = true;
   const out = {};
   if (!criteria || typeof criteria !== "object") return out;
@@ -225,19 +225,22 @@ function impliedValues(criteria, vars, firstClauseOnly) {
     const block = criteria[key];
     if (Array.isArray(block)) {
       for (const item of block) {
-        Object.assign(out, impliedValues(item, vars, firstClauseOnly));
+        Object.assign(out, impliedValues(item, vars, firstClauseOnly, owned));
         if (key === "any" && firstClauseOnly && Object.keys(out).length) break;
       }
     }
   }
   const expr = criteria.expr;
   if (typeof expr === "string" && expr.trim()) {
-    Object.assign(out, impliedFromExpr(expr, vars, firstClauseOnly));
+    Object.assign(out, impliedFromExpr(expr, vars, firstClauseOnly, owned));
+  }
+  if (criteria.http_status !== undefined && criteria.http_status !== null && !("http_status" in out)) {
+    out.http_status = String(criteria.http_status);
   }
   return out;
 }
 
-function impliedFromExpr(expr, vars, firstClauseOnly) {
+function impliedFromExpr(expr, vars, firstClauseOnly, owned) {
   let text = expr.trim();
   if (text.startsWith("${") && text.endsWith("}")) text = text.slice(2, -1).trim();
   const out = {};
@@ -245,14 +248,14 @@ function impliedFromExpr(expr, vars, firstClauseOnly) {
   if (firstClauseOnly && clauses.length) clauses = clauses.slice(0, 1);
   for (const clause of clauses) {
     for (const leaf of splitTop(clause, "&&")) {
-      const [name, value] = impliedFromLeaf(leaf.trim(), vars);
+      const [name, value] = impliedFromLeaf(leaf.trim(), vars, owned);
       if (name && !(name in out)) out[name] = value;
     }
   }
   return out;
 }
 
-function impliedFromLeaf(leaf, vars) {
+function impliedFromLeaf(leaf, vars, owned) {
   for (const op of ["==", ">=", "<=", ">", "<"]) {
     const at = findOp(leaf, op);
     if (at <= 0) continue;
@@ -262,9 +265,23 @@ function impliedFromLeaf(leaf, vars) {
     const quoted = raw.length >= 2 && raw[0] === raw[raw.length - 1] &&
                    (raw[0] === "'" || raw[0] === '"');
     const literal = operand(raw, vars);
+    if (op === "==" && owned && !quoted && /^[A-Za-z_][A-Za-z0-9_]*$/.test(raw) &&
+        owned.has(raw) && !owned.has(name)) {
+      // `${EARLIER == MINE}`: this step's own register is the side to set
+      const known = resolveName(name, vars);
+      if (known !== undefined && known !== null && known !== "") {
+        return [raw, typeof known === "string" ? known : stringify(known)];
+      }
+    }
     if (!quoted && literal === raw && /^[A-Za-z_][A-Za-z0-9_]*$/.test(raw)) {
       // The right-hand side is another VARIABLE, as in
-      // `${LINK_UP_COUNT == REMOTE_NODE_COUNT}`: no single value is implied.
+      // `${LINK_UP_COUNT == REMOTE_NODE_COUNT}`: no single value is implied -
+      // unless the LEFT side is already known (the checksum pattern), when
+      // success means this step captures that same value.
+      const known = resolveName(name, vars);
+      if (op === "==" && known !== undefined && known !== null && known !== "") {
+        return [raw, typeof known === "string" ? known : stringify(known)];
+      }
       return [null, null];
     }
     if (op === "==") return [name, literal];
@@ -287,11 +304,141 @@ function renderModeFor(phaseId, phaseName) {
   return MODE_INTERACTIVE;
 }
 
-/** The macro-server Arglist values a real run supplies (ciq.DEFAULT_PARAMS). */
+/** The macro-server Arglist values a real run supplies (ciq.DEFAULT_PARAMS).
+ *  The first seven are SimActivityRunner's; the rest are what MopExecutionUtil
+ *  and CliAutomationEngine put in scope from the GRC section and the Arglist,
+ *  with the simulator's values. activityParams() fills NODE_TYPE,
+ *  SUB_ACTIVITY_NAME and INPUT_JSON_FILE_NAME for the activity at hand. */
 const DEFAULT_PARAMS = {
   ORDER_NO: "12345", PARENT_REQ_ID: "12345", CHILD_REQ_ID: "10057",
   CR_GROUP: "CR1", CR_NAME: "CR1", NODE_TYPE: "PGW_RDS", REQ_TYPE: "1",
+  SUB_ACTIVITY_NAME: "", ROLLBACK_ONLY: "false",
+  INPUT_JSON_FILE_NAME: "/opt/clicr/input/order.json",
+  OUTPUT_LOGS_FILE_LOCATION: "/opt/clicr/runs/10057/reports/logs",
+  OUTPUT_JSON_REPORT_NAME: "/opt/clicr/runs/10057/reports/json",
+  MOP_EXEC_LOG_FILE: "/opt/clicr/runs/10057/reports/logs/execution.log",
+  REPO_IP: "127.0.0.1", REPO_USER: "installer", REPO_PASSWORD: "ROOT",
+  NIAM_IP: "127.0.0.1", M2MPORT: "22", M2MUSER: "admin", M2MPASSWORD: "admin",
 };
+
+/** NODE_TYPE, SUB_ACTIVITY_NAME and INPUT_JSON_FILE_NAME for one activity -
+ *  ciq.activity_params(). The template file is <NODE_TYPE>_<activity>.yaml
+ *  (MopExecutionUtil), so the node type is what is left of the file name once
+ *  the CIQ's activity is taken off the end. */
+function activityParams(stem, data, ciqName) {
+  const out = {};
+  const activity = String((data && data.activity) || "").trim();
+  let nodeType = String((data && data.nodeType) || "").trim();
+  stem = String(stem || "").replace(/\.ya?ml$/i, "");
+  if (activity && stem.toUpperCase().endsWith("_" + activity.toUpperCase())) {
+    nodeType = stem.slice(0, stem.length - activity.length - 1);
+  }
+  if (!nodeType && stem) nodeType = stem.split("_")[0];
+  if (nodeType) out.NODE_TYPE = nodeType;
+  if (activity) out.SUB_ACTIVITY_NAME = activity;
+  if (ciqName) out.INPUT_JSON_FILE_NAME = "/opt/clicr/input/" + ciqName;
+  return out;
+}
+
+/* ------------------------------------------------------------------ *
+ *  step ids - YamlWorkflowLoader.ensureStepIds()                      *
+ * ------------------------------------------------------------------ */
+function phaseBlocks(workflow) {
+  const phases = (workflow && workflow.phases) || {};
+  return Object.keys(phases).filter(k => phases[k] && typeof phases[k] === "object" &&
+                                         !Array.isArray(phases[k]))
+    .map(k => [k, phases[k]]);
+}
+
+/** Every step's id: its own `id:`, or auto_step_N numbered the way the engine
+ *  numbers them. A Map keyed by the step object; the workflow is untouched. */
+function assignStepIds(workflow) {
+  const blocks = [(workflow && workflow.steps) || []]
+    .concat(phaseBlocks(workflow).map(([, b]) => b.steps || []));
+  const used = new Set();
+  let seen = new Set();
+  const collect = steps => {
+    for (const step of steps || []) {
+      if (!step || typeof step !== "object" || seen.has(step)) continue;
+      seen.add(step);
+      const sid = step.id;
+      if (sid !== undefined && sid !== null && String(sid).trim()) used.add(String(sid).trim());
+      collect(step.steps);
+    }
+  };
+  for (const steps of blocks) collect(steps);
+  const ids = new Map();
+  let seq = 1;
+  seen = new Set();
+  const assign = steps => {
+    for (const step of steps || []) {
+      if (!step || typeof step !== "object" || seen.has(step)) continue;
+      seen.add(step);
+      let sid = step.id;
+      if (sid === undefined || sid === null || !String(sid).trim()) {
+        while (used.has("auto_step_" + seq)) seq++;
+        sid = "auto_step_" + seq;
+        used.add(sid);
+        seq++;
+      }
+      ids.set(step, String(sid).trim());
+      assign(step.steps);
+    }
+  };
+  for (const steps of blocks) assign(steps);
+  return ids;
+}
+
+/** A validation branch's `vars:` as [[name, raw]] - a mapping, as
+ *  ValidationBranchDefinition reads it; a {name, value} list is accepted too. */
+function branchVarItems(branch) {
+  const raw = (branch && typeof branch === "object") ? branch.vars : null;
+  if (Array.isArray(raw)) {
+    return raw.filter(e => e && typeof e === "object" && e.name)
+      .map(e => [String(e.name), e.value === undefined ? "" : e.value]);
+  }
+  if (raw && typeof raw === "object") return Object.keys(raw).map(k => [String(k), raw[k]]);
+  return [];
+}
+
+/** Every variable a step can set at run time, and the first step that sets
+ *  it - expander.runtime_producers(). {name: [step id, how]} */
+function runtimeProducers(workflow, ids) {
+  ids = ids || assignStepIds(workflow);
+  const out = {};
+  const note = (name, step, how) => {
+    name = String(name === undefined || name === null ? "" : name).trim();
+    if (name && !(name in out)) out[name] = [ids.get(step) || step.id, how];
+  };
+  const walk = steps => {
+    for (const step of steps || []) {
+      if (!step || typeof step !== "object") continue;
+      for (const entry of step.register || []) {
+        if (!entry || typeof entry !== "object") continue;
+        for (const name of groupNamesOf(String(entry.regex === undefined || entry.regex === null ? "" : entry.regex)))
+          note(name, step, "register");
+        note(entry.count_var, step, "register count");
+        note(entry.name, step, "register");
+      }
+      const rest = step.rest;
+      if (rest && typeof rest === "object" && !Array.isArray(rest)) {
+        for (const rule of rest.response_template || []) if (rule && typeof rule === "object") note(rule.name, step, "REST response_template");
+        for (const rule of rest.response_headers || []) if (rule && typeof rule === "object") note(rule.name, step, "REST response header");
+        note("http_status", step, "REST status");
+      }
+      const validation = step.validation;
+      if (validation && typeof validation === "object") {
+        for (const branch of ["success", "failure", "warning"]) {
+          for (const [name] of branchVarItems(validation[branch])) note(name, step, "validation " + branch + " vars");
+        }
+      }
+      walk(step.steps);
+    }
+  };
+  walk(workflow && workflow.steps);
+  for (const [, block] of phaseBlocks(workflow)) walk(block.steps);
+  return out;
+}
 
 class Expander {
   constructor(workflow, data, params, template) {
@@ -300,6 +447,21 @@ class Expander {
     this.params = Object.assign({}, params || {});
     this.template = template || null;
     this.defaults = ((this.workflow.globals || {}).defaults) || {};
+    this.nodes = this.workflow.nodes || {};
+    this.stepIds = assignStepIds(this.workflow);
+    this.producers = runtimeProducers(this.workflow, this.stepIds);
+    this.mutable = new Set(Object.keys(this.producers).concat(Object.keys(this.params)));
+    this.byId = {};
+    const walk = steps => {
+      for (const step of steps || []) {
+        if (!step || typeof step !== "object") continue;
+        const sid = this.stepIds.get(step);
+        (this.byId[sid] = this.byId[sid] || []).push(step);
+        walk(step.steps);
+      }
+    };
+    walk(this.workflow.steps);
+    for (const [, block] of phaseBlocks(this.workflow)) walk(block.steps);
   }
 
   /** globals.vars as an ordered [name, raw] list, for the page's param panel. */
@@ -335,6 +497,22 @@ class Expander {
     vars.nodeGroup = node.nodeGroup || "";
     vars.crGroup = node.crGroup || "";
 
+    // CliAutomationEngine.executeForNode(): the aliases a real run adds
+    promoteNiam(vars, node);
+    if (node.node !== undefined && node.node !== null) vars.currentNode = node.node;
+    if (node.crGroup !== undefined && node.crGroup !== null && !("currentCrGroup" in vars))
+      vars.currentCrGroup = node.crGroup;
+    vars.currentNodeData = node;
+    const collection = Object.keys(node).map(k => node[k]).find(v => Array.isArray(v));
+    if (collection !== undefined) vars.currentNodeCollection = collection;
+    for (const [target, source] of [["VERSION", "version"], ["version", "VERSION"]]) {
+      if (!(target in vars) && vars[source] !== undefined && vars[source] !== null) vars[target] = vars[source];
+    }
+
+    // MopExecutionUtil: a rollback-only run sets both flags
+    if (String(vars.ROLLBACK_ONLY === undefined ? "" : vars.ROLLBACK_ONLY).toLowerCase() === "true")
+      vars.ROLLBACK_REQUIRED = "true";
+
     // MopGenerator scopes the outer loop to this node's own nodeGroup
     const group = this.nodeGroupOf(node);
     vars.nodeGroups = group ? [group] : [];
@@ -343,8 +521,11 @@ class Expander {
     // globals.vars in declaration order, each interpolated against what is
     // known so far; a request parameter always wins.
     const block = (this.workflow.globals || {}).vars || {};
+    const rollbackOnly = String(this.params.ROLLBACK_ONLY === undefined ? "" : this.params.ROLLBACK_ONLY)
+      .toLowerCase() === "true";
     for (const key of Object.keys(block)) {
       if (key in this.params) continue;
+      if (key === "ROLLBACK_REQUIRED" && rollbackOnly) continue;
       const value = block[key];
       vars[key] = (typeof value === "string") ? interpolate(value, vars) : value;
     }
@@ -364,29 +545,47 @@ class Expander {
 
   expand(node) {
     const vars = this.baseContext(node);
-    const state = { seq: 0, steps: [], warnings: [] };
-    const phases = this.workflow.phases || {};
+    const state = { seq: 0, steps: [], warnings: [], loops: {}, loopSeq: 0 };
+    const phases = [];
 
-    for (const phaseId of Object.keys(phases)) {
-      const phase = phases[phaseId];
-      if (!phase || typeof phase !== "object") continue;
+    for (const [phaseId, phase] of phaseBlocks(this.workflow)) {
       const gate = this.gate(vars, phase.when);
-      if (gate.state === false) {
-        state.warnings.push("phase " + phaseId + " skipped: when " + phase.when + " is false");
-        continue;
-      }
-      const phaseCtx = {
-        id: phaseId,
+      const javaId = String(phase.name === undefined || phase.name === null ? "" : phase.name).trim() || phaseId;
+      let then = phase.then;
+      then = Array.isArray(then) ? then.map(String) : (then ? [String(then)] : []);
+      const descriptor = {
+        key: phaseId,
+        id: javaId,
         name: phase.name || phaseId,
         description: phase.description || "",
-        mode: renderModeFor(phaseId, phase.name),
+        when: phase.when === undefined ? null : phase.when,
+        when_state: gate.state,
+        on_failure: (phase.on_failure !== undefined && phase.on_failure !== null)
+          ? String(phase.on_failure).trim() : null,
+        then: then,
+        post_failure: javaId.toUpperCase().indexOf("ROLLBACK") >= 0 || then.length > 0,
+        render_mode: renderModeFor(phaseId, phase.name),
+        steps: 0,
       };
+      if (!phase.steps || !phase.steps.length) continue;     // normalizePhases()
+      phases.push(descriptor);
+      const phaseCtx = Object.assign({}, descriptor, { id: phaseId, mode: descriptor.render_mode });
+
+      // A phase the happy path gates off is still documented - its gate may
+      // open at run time - but its steps must not leak into later phases.
+      const snapshot = gate.state === false ? Object.assign({}, vars) : null;
       const phaseVars = phase.vars || {};
       for (const key of Object.keys(phaseVars)) {
         const value = phaseVars[key];
         vars[key] = (typeof value === "string") ? interpolate(value, vars) : value;
       }
+      const before = state.steps.length;
       this.walk(phase.steps || [], vars, phaseCtx, state, []);
+      descriptor.steps = state.steps.length - before;
+      if (snapshot) {
+        for (const k of Object.keys(vars)) delete vars[k];
+        Object.assign(vars, snapshot);
+      }
     }
 
     return {
@@ -394,6 +593,8 @@ class Expander {
       steps: state.steps,
       warnings: state.warnings,
       vars: vars,
+      phases: phases,
+      loops: state.loops,
     };
   }
 
@@ -420,28 +621,76 @@ class Expander {
     }
   }
 
+  /** FALSE, and reading nothing a run can change - only then may the walk act
+   *  on a loop gate the way the engine will. */
+  decidedFalse(vars, expression) {
+    if (this.gate(vars, expression).state !== false) return false;
+    return !namesIn(expression, false).some(n => this.mutable.has(n));
+  }
+
+  decidedTrue(vars, expression) {
+    if (this.gate(vars, expression).state !== true) return false;
+    return !namesIn(expression, false).some(n => this.mutable.has(n));
+  }
+
   walkLoop(loop, vars, phaseCtx, state, loopPath) {
+    // a loop's own when/skip_when is evaluated ONCE, before any item is bound
+    if (loop.when !== undefined && loop.when !== null && this.decidedFalse(vars, loop.when)) return;
+    if (loop.skip_when !== undefined && loop.skip_when !== null && String(loop.skip_when).trim() &&
+        this.decidedTrue(vars, loop.skip_when)) return;
+
     const itemVar = loop.item_var || "item";
     let items = resolveForEach(loop.for_each, vars);
     const limit = loop.max_iterations;
-    if (typeof limit === "number" && limit >= 0) items = items.slice(0, limit);
+    const bounded = typeof limit === "number" && Number.isInteger(limit) && limit >= 0;
+    const overflow = bounded && items.length > limit;
+    if (bounded) items = items.slice(0, limit);
     if (loop.reverse_order === true) items = items.slice().reverse();
+
+    state.loopSeq += 1;
+    const uid = "L" + String(state.loopSeq).padStart(4, "0");
+    const sid = this.stepIds.get(loop);
+    state.loops[uid] = {
+      uid: uid,
+      step_id: sid,
+      phase: phaseCtx.id,
+      var: itemVar,
+      items: jsonable(items),
+      count: items.length,
+      when: loop.when === undefined ? null : loop.when,
+      skip_when: loop.skip_when === undefined ? null : loop.skip_when,
+      continue_when: loop.continue_when === undefined ? null : loop.continue_when,
+      break_when: loop.break_when === undefined ? null : loop.break_when,
+      max_iterations: bounded ? limit : null,
+      overflow: !!overflow,
+      on_failure: this.loopOnFailure(loop),
+      depth: loopPath.length,
+      parent: loopPath.length ? loopPath[loopPath.length - 1].loop : null,
+    };
+    if (overflow) {
+      state.warnings.push("loop " + sid + " (" + itemVar + ") has more items than max_iterations " +
+                          limit + " - the engine FAILS the loop after the first " + limit);
+    }
 
     for (let index = 0; index < items.length; index++) {
       vars[itemVar] = items[index];
-
-      if (loop.continue_when !== undefined && loop.continue_when !== null) {
-        // ExecutionOrchestrator:591 - the body runs only when TRUE. UNKNOWN
-        // keeps the iteration: a MOP must not drop steps whose filter depends
-        // on runtime data.
-        if (this.gate(vars, loop.continue_when).state === false) continue;
-      }
+      if (loop.continue_when !== undefined && loop.continue_when !== null &&
+          this.decidedFalse(vars, loop.continue_when)) continue;
       if (loop.break_when !== undefined && loop.break_when !== null &&
-          this.gate(vars, loop.break_when).state === true) break;
-
+          this.decidedTrue(vars, loop.break_when)) break;
       this.walk(loop.steps || [], vars, phaseCtx, state,
-                loopPath.concat([{ var: itemVar, index: index, label: loopLabel(items[index]) }]));
+                loopPath.concat([{ var: itemVar, index: index, label: loopLabel(items[index]), loop: uid }]));
     }
+  }
+
+  loopOnFailure(loop) {
+    let behaviour = loop.on_failure;
+    if (behaviour === undefined || behaviour === null) behaviour = this.defaults.on_failure;
+    if (typeof behaviour === "string") {
+      const low = behaviour.trim().toLowerCase();
+      return (low === "continue" || low === "warning") ? low : "stop";
+    }
+    return "stop";
   }
 
   emit(raw, vars, phaseCtx, state, loopPath) {
@@ -453,32 +702,47 @@ class Expander {
       ? { state: false, trace: [] } : this.gate(vars, skipRaw);
 
     const missing = [];
-    const sendRaw = raw.send;
-    const send = (typeof sendRaw === "string") ? interpolate(sendRaw, vars, missing) : sendRaw;
-    const description = interpolate(raw.command_description || "", vars, missing);
     const nodeRef = raw.node;
     const nodeTarget = (typeof nodeRef === "string") ? interpolate(nodeRef, vars, missing) : nodeRef;
+    const cmd = this.command(raw, vars, nodeTarget);
+    const sendRaw = cmd.send;
+    const send = (typeof sendRaw === "string") ? interpolate(sendRaw, vars, missing) : sendRaw;
+    if (cmd.rest && typeof cmd.rest.body_raw === "string") interpolate(cmd.rest.body_raw, vars, missing);
+    const description = interpolate(raw.command_description || "", vars, missing);
     const unresolved = this.explain(missing, vars, state);
 
     const validation = this.validation(raw, vars);
     const implied = validation.impliedOnSuccess || {};
     const register = JSON.parse(JSON.stringify(raw.register || []));
-    const okOutput = successOutput(register, validation.successCriteria, implied, implied);
-    const badOutput = failureOutput(register, validation.successCriteria, implied);
+    const liveRegister = interpolatedRegister(register, vars);
+    let okOutput, okStatus = null, badOutput, badStatus = null, badExit;
+    if (cmd.rest) {
+      const r = restOutputs(cmd.rest.response_template, validation.successCriteria, implied,
+                            liveRegister, this.preferredStatuses(raw));
+      okOutput = r[0]; okStatus = r[1]; badOutput = r[2]; badStatus = r[3];
+      badExit = badStatus !== null ? 0 : -1;
+    } else {
+      okOutput = successOutput(liveRegister, validation.successCriteria, implied, implied);
+      badOutput = failureOutput(liveRegister, validation.successCriteria, implied);
+      badExit = badOutput !== SYNTH_MARKER ? 0 : 1;
+    }
 
     const consumes = Array.from(new Set(
       tokensIn(sendRaw || "")
+        .concat(tokensIn((cmd.rest && cmd.rest.body_raw) || ""))
         .concat(tokensIn(String(raw.when || "")))
         .concat(tokensIn(String(raw.skip_when || ""))))).sort();
 
+    const prompt = raw.prompt_regex;
     state.seq += 1;
     const step = {
       uid: "s" + String(state.seq).padStart(4, "0"),
+      step_id: this.stepIds.get(raw),
       phase: phaseCtx.id,
       phase_name: phaseCtx.name,
       phase_description: phaseCtx.description,
       seq: state.seq,
-      kind: raw.email ? "email" : (nodeTarget === "local" ? "local" : "remote"),
+      kind: cmd.kind,
       node_ref: nodeRef === undefined ? null : nodeRef,
       node_target: nodeTarget === undefined ? null : nodeTarget,
       description: description,
@@ -505,17 +769,29 @@ class Expander {
       logs: raw.logs === undefined ? null : raw.logs,
       hide_when_skipped: !!raw.hide_when_skipped,
       use_exit_code: !!raw.use_exit_code,
+      ignore_exit: typeof prompt === "string" && !!prompt.trim(),
+      rest: cmd.rest,
+      sftp: cmd.sftp,
       success_output: okOutput,
+      success_status: okStatus,
       failure_output: badOutput,
+      failure_status: badStatus,
+      failure_exit: badExit,
       render_mode: phaseCtx.mode,
     };
 
-    // Assumed success: the registers, then whatever the criteria imply.
-    // Applied only when the step is not definitely skipped, so a skipped step
-    // cannot poison later interpolation.
+    // Assumed success: the REST response_template and status, the registers
+    // over the success output, whatever the criteria still assert, and the
+    // success branch's vars. Applied only when the step is not definitely
+    // skipped, so a skipped step cannot poison later interpolation.
     const produced = [];
     if (when.state !== false && skip.state !== true) {
       const log = [];
+      if (cmd.rest) {
+        applyResponseTemplate(cmd.rest.response_template, okOutput, vars, log);
+        vars.http_status = okStatus;
+        log.push({ name: "http_status", value: String(okStatus), source: "REST status" });
+      }
       applyRegisters(step.register, okOutput, vars, log);
       for (const entry of log) {
         if (entry.value !== null && entry.value !== undefined) {
@@ -532,40 +808,131 @@ class Expander {
       }
       for (const name of Object.keys(validation.varsOnSuccess || {})) {
         vars[name] = validation.varsOnSuccess[name];
-        produced.push({ name: name, value: vars[name], source: "validation success vars" });
+        produced.push({ name: name, value: stringify(vars[name]), source: "validation success vars" });
       }
     }
     step.produces = produced;
     state.steps.push(step);
   }
 
+  /** {kind, send, rest, sftp} - describeStepCommand(). */
+  command(raw, vars, nodeTarget) {
+    const nodeDef = (typeof nodeTarget === "string" && this.nodes[nodeTarget]) || null;
+    const nodeType = String((nodeDef && nodeDef.type) || "").toLowerCase();
+    const isMap = v => v && typeof v === "object" && !Array.isArray(v);
+    let kind;
+    if (raw.email) kind = "email";
+    else if (isMap(raw.rest) || nodeType === "rest") kind = "rest";
+    else if (isMap(raw.sftp)) kind = "sftp";
+    else if (nodeTarget === "local" || nodeType === "local") kind = "local";
+    else kind = "remote";
+
+    if (typeof raw.send === "string") return { kind: kind, send: raw.send, rest: null, sftp: null };
+
+    if (isMap(raw.sftp)) {
+      const s = raw.sftp;
+      const text = "sftp " + (s.operation || "sftp") + " local=" + (s.local_path || "") +
+                   " remote=" + (s.remote_path || "");
+      return { kind: kind, send: text, rest: null, sftp: JSON.parse(JSON.stringify(s)) };
+    }
+
+    if (isMap(raw.rest)) {
+      const r = raw.rest;
+      const method = String(r.method || "GET").toUpperCase().trim();
+      const pathRaw = String(r.path === undefined || r.path === null ? "" : r.path).trim();
+      const baseRaw = String(((nodeDef && nodeDef.rest) || {}).base_url === undefined ||
+                             ((nodeDef && nodeDef.rest) || {}).base_url === null
+                             ? "" : nodeDef.rest.base_url).trim();
+      const path = interpolate(pathRaw, vars);
+      const base = interpolate(baseRaw, vars);
+      const joiner = (path && base && !path.startsWith("/")) ? "/" : "";
+      const text = (pathRaw || baseRaw) ? (method + " " + baseRaw + joiner + pathRaw).trim() : null;
+      let body = null, bodyType = null;
+      for (const key of ["body_json", "body_map", "body_file", "multipart"]) {
+        if (r[key] !== undefined && r[key] !== null) {
+          bodyType = key;
+          body = typeof r[key] === "string" ? r[key] : pyDumps(r[key]);
+          break;
+        }
+      }
+      const block = {
+        method: method,
+        path_raw: pathRaw,
+        base_url_raw: baseRaw,
+        body_raw: body,
+        body_type: bodyType,
+        content_type: r.body_content_type === undefined ? null : r.body_content_type,
+        query: r.query === undefined ? null : r.query,
+        response_template: JSON.parse(JSON.stringify(r.response_template || [])),
+        response_headers: JSON.parse(JSON.stringify(r.response_headers || [])),
+        download_to: r.download_to === undefined ? null : r.download_to,
+        has_base_url: !!base,
+      };
+      return { kind: kind, send: text, rest: block, sftp: null };
+    }
+    return { kind: kind, send: raw.send === undefined ? null : raw.send, rest: null, sftp: null };
+  }
+
+  /** HTTP statuses this step's on_failure handlers are gated on. */
+  preferredStatuses(raw) {
+    const behaviour = raw.on_failure;
+    if (!behaviour || typeof behaviour !== "object" || Array.isArray(behaviour)) return [];
+    let targets = behaviour.run;
+    targets = Array.isArray(targets) ? targets : (targets ? [targets] : []);
+    const found = [];
+    for (const target of targets) {
+      let name = String(target);
+      if (name.toLowerCase().startsWith("step:")) name = name.slice(5).trim();
+      for (const step of this.byId[name] || []) {
+        for (const literal of statusLiterals(step.when)) if (found.indexOf(literal) < 0) found.push(literal);
+      }
+    }
+    return found;
+  }
+
   validation(raw, vars) {
-    const block = raw.validation || {};
-    const success = block.success || {};
-    const failure = block.failure || {};
-    const warning = block.warning || {};
+    const block = (raw.validation && typeof raw.validation === "object") ? raw.validation : {};
+    const pick = v => (v && typeof v === "object" && !Array.isArray(v)) ? v : {};
+    const success = pick(block.success);
+    const failure = pick(block.failure);
+    const warning = pick(block.warning);
     return {
-      enabled: !!block.enabled,
+      enabled: Object.keys(block).length > 0 && block.enabled !== false,
       description: interpolate(block.description || "", vars),
       successCriteria: success.criteria || {},
       successMessage: success.message || "",
       failureMessage: failure.message || warning.message || "",
+      warningMessage: warning.message || "",
+      failureCriteria: failure.criteria === undefined ? null : failure.criteria,
+      hasSuccessBranch: "success" in block,
+      hasFailureBranch: "failure" in block,
       hasWarningBranch: !!Object.keys(warning).length,
-      impliedOnSuccess: impliedValues(success.criteria || {}, vars),
+      impliedOnSuccess: impliedValues(success.criteria || {}, vars, true, ownedNames(raw)),
       varsOnSuccess: branchVars(success, vars),
       varsOnFailure: branchVars(Object.keys(failure).length ? failure : warning, vars),
+      branchVars: { success: rawVars(success), failure: rawVars(failure), warning: rawVars(warning) },
     };
   }
 
+  /** handleFailure(), normalised - see expander._on_failure(). */
   onFailure(raw) {
-    const behaviour = raw.on_failure !== undefined ? raw.on_failure
-                                                   : (this.defaults.on_failure || "stop");
-    if (behaviour && typeof behaviour === "object") {
-      if (behaviour.run) return { mode: "run", step: behaviour.run };
-      const first = Object.keys(behaviour).map(k => behaviour[k])[0];
-      return { mode: String(first === undefined ? "stop" : first) };
+    const behaviour = raw.on_failure !== undefined ? raw.on_failure : this.defaults.on_failure;
+    if (behaviour === undefined || behaviour === null) return { mode: "stop", raw: null };
+    if (typeof behaviour === "object" && !Array.isArray(behaviour)) {
+      const list = v => Array.isArray(v) ? v.map(String) : (v ? [String(v)] : []);
+      const run = list(behaviour.run);
+      const then = list(behaviour.then);
+      const next = String(behaviour.next === undefined || behaviour.next === null ? "" : behaviour.next)
+        .trim().toLowerCase() === "continue" ? "continue" : null;
+      const email = ("email" in behaviour) && behaviour.email !== false;
+      const out = { mode: run.length ? "run" : (next ? "continue" : "stop"),
+                    run: run, then: then, next: next, email: email };
+      if (run.length) out.step = run;
+      return out;
     }
-    return { mode: String(behaviour) };
+    const text = String(behaviour).trim();
+    const low = text.toLowerCase();
+    return { mode: ["continue", "warning", "email", "stop"].indexOf(low) >= 0 ? low : "stop", raw: text };
   }
 
   email(raw, vars) {
@@ -592,16 +959,7 @@ class Expander {
     if (expression === undefined || expression === null || !String(expression).trim()) {
       return { state: true, trace: [] };
     }
-    const text = String(expression).trim();
-    let tokens;
-    if (text.startsWith("${") && text.endsWith("}")) {
-      // The whole condition is one ${...} wrapper, so the placeholder pattern
-      // returns the entire expression as a single "token". Read the
-      // identifiers out of the expression instead.
-      tokens = bareNames(text.slice(2, -1));
-    } else {
-      tokens = tokensIn(text);
-    }
+    const tokens = namesIn(expression, true);
     const missing = tokens.filter(t => {
       const v = resolveName(t, vars);
       return v === undefined || v === null;
@@ -611,7 +969,8 @@ class Expander {
     return { state: missing.length ? null : !!result, trace: trace };
   }
 
-  /** Ask the mapping why a CIQ reference resolved to nothing. */
+  /** Ask the mapping why a CIQ reference resolved to nothing - or say that a
+   *  step sets it at run time, which needs no mapping at all. */
   explain(missing, vars, state) {
     const seen = new Set();
     const out = [];
@@ -619,6 +978,13 @@ class Expander {
       if (seen.has(token)) continue;
       seen.add(token);
       let reason = whyUnresolved(token, vars);
+      const root = token.split(".")[0].split("[")[0].trim();
+      const producer = this.producers[root];
+      if (producer) {
+        out.push({ token: token, reason: root + " is set at run time by step " + producer[0] +
+                   " (" + producer[1] + ")", runtime: true });
+        continue;
+      }
       if (this.template && this.template.doc) {
         const field = ciqField(token);
         if (field) {
@@ -638,20 +1004,104 @@ class Expander {
   }
 }
 
+/** applyValidation(): every value interpolated against the context as it
+ *  stood BEFORE any of them is set. */
 function branchVars(branch, vars) {
   const out = {};
-  // `vars:` is a LIST of {name, value}. Where a workflow writes it as a
-  // mapping instead, python iterates the keys and discards them all because
-  // they are not dicts; iterating a mapping in JS throws, so the shapes have
-  // to be told apart explicitly to keep the two sides identical.
-  const entries = (branch || {}).vars;
-  if (!Array.isArray(entries)) return out;
-  for (const entry of entries) {
-    if (entry && typeof entry === "object" && entry.name) {
-      out[entry.name] = interpolate(entry.value === undefined ? "" : entry.value, vars);
-    }
+  for (const [name, value] of branchVarItems(branch)) {
+    out[name] = typeof value === "string" ? interpolate(value, vars) : interpolateObject(value, vars);
   }
   return out;
+}
+
+/** The variables a step's own registers and REST response set. */
+function ownedNames(raw) {
+  const out = new Set();
+  for (const entry of raw.register || []) {
+    if (!entry || typeof entry !== "object") continue;
+    for (const n of groupNamesOf(String(entry.regex === undefined || entry.regex === null ? "" : entry.regex))) out.add(n);
+    for (const key of ["count_var", "name"]) if (entry[key]) out.add(String(entry[key]));
+  }
+  const rest = raw.rest;
+  if (rest && typeof rest === "object") {
+    for (const rule of rest.response_template || []) if (rule && typeof rule === "object" && rule.name) out.add(String(rule.name));
+  }
+  return out;
+}
+
+function rawVars(branch) {
+  const out = {};
+  for (const [name, value] of branchVarItems(branch)) out[name] = value;
+  return out;
+}
+
+/** The variables a condition reads; `full` keeps dotted paths whole. */
+function namesIn(expression, full) {
+  const text = String(expression === undefined || expression === null ? "" : expression).trim();
+  const tokens = (text.startsWith("${") && text.endsWith("}")) ? bareNames(text.slice(2, -1))
+                                                               : tokensIn(text);
+  return full ? tokens : tokens.map(t => t.split(".")[0].split("[")[0]);
+}
+
+/** 3-digit HTTP statuses a gate compares a status variable against. */
+function statusLiterals(expression) {
+  const out = [];
+  const re = /([A-Za-z_]*status[A-Za-z_]*)\s*==\s*['"]?(\d{3})['"]?/gi;
+  let m;
+  while ((m = re.exec(String(expression === undefined || expression === null ? "" : expression)))) {
+    const n = parseInt(m[2], 10);
+    if (out.indexOf(n) < 0) out.push(n);
+  }
+  return out;
+}
+
+function interpolatedRegister(register, vars) {
+  return (register || []).map(entry => {
+    if (entry && typeof entry === "object" && typeof entry.regex === "string") {
+      return Object.assign({}, entry, { regex: interpolate(entry.regex, vars) });
+    }
+    return entry;
+  });
+}
+
+/** CliAutomationEngine.promoteNiamId() + the niamID/niamId/NIAM_ID aliases. */
+function promoteNiam(vars, node) {
+  let niam;
+  for (const k of ["niamID", "niamId", "NIAM_ID"]) {
+    if (node[k] !== undefined && node[k] !== null) { niam = node[k]; break; }
+  }
+  if (niam === undefined) niam = findNested(node, ["niamID", "niamId", "NIAM_ID"]);
+  if (niam !== undefined && niam !== null) {
+    for (const k of ["niamID", "niamId", "NIAM_ID"]) vars[k] = niam;
+  }
+}
+
+function findNested(value, keys) {
+  if (Array.isArray(value)) {
+    for (const child of value) {
+      const found = findNested(child, keys);
+      if (found !== undefined && found !== null) return found;
+    }
+  } else if (value && typeof value === "object") {
+    for (const k of keys) if (value[k] !== undefined && value[k] !== null) return value[k];
+    for (const k of Object.keys(value)) {
+      const found = findNested(value[k], keys);
+      if (found !== undefined && found !== null) return found;
+    }
+  }
+  return undefined;
+}
+
+/** Loop items travel to the page as JSON; dates and the like do not. */
+function jsonable(value) {
+  if (Array.isArray(value)) return value.map(jsonable);
+  if (value instanceof Date) return value.toISOString();
+  if (value && typeof value === "object") {
+    const out = {};
+    for (const k of Object.keys(value)) out[String(k)] = jsonable(value[k]);
+    return out;
+  }
+  return value === undefined ? null : value;
 }
 
 function loopLabel(item) {
@@ -684,6 +1134,7 @@ function bareNames(expr) {
 
 if (typeof module !== "undefined" && module.exports) {
   module.exports = { Expander, OutputTemplate, normalizeCiq, impliedValues,
-                     renderModeFor, DEFAULT_PARAMS, bareNames, ciqField,
+                     renderModeFor, DEFAULT_PARAMS, activityParams, bareNames, ciqField,
+                     assignStepIds, runtimeProducers, branchVarItems,
                      MODE_CHECKLIST, MODE_INTERACTIVE };
 }

@@ -38,6 +38,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -131,7 +132,8 @@ def run_one(yaml_path, mapping, ciq_path, out_dir, synthetic, extra_args):
               "ciq": os.path.basename(ciq_path) if ciq_path else None,
               "ciqSynthetic": synthetic, "out": out_dir,
               "ok": False, "nodes": [], "documents": [], "error": None,
-              "steps": 0, "interactive": 0, "unresolved": [], "warnings": []}
+              "steps": 0, "interactive": 0, "unresolved": [], "warnings": [],
+              "lint": []}
 
     command = [sys.executable, MOPGEN, "--yaml", yaml_path, "--ciq", ciq_path,
                "--out", out_dir, "--json", "--quiet"]
@@ -157,8 +159,9 @@ def run_one(yaml_path, mapping, ciq_path, out_dir, synthetic, extra_args):
         meta = doc.get("meta") or {}
         steps = doc.get("steps") or []
         interactive = sum(1 for s in steps if s.get("render_mode") == "interactive")
+        # a reference a step sets at run time is not a gap in the order
         tokens = sorted(set(u["token"] for s in steps
-                            for u in (s.get("unresolved") or [])))
+                            for u in (s.get("unresolved") or []) if not u.get("runtime")))
         record["nodes"].append({
             "node": meta.get("node"), "crGroup": meta.get("crGroup"),
             "steps": len(steps), "interactive": interactive,
@@ -173,6 +176,8 @@ def run_one(yaml_path, mapping, ciq_path, out_dir, synthetic, extra_args):
         for warning in doc.get("warnings") or []:
             if warning not in record["warnings"]:
                 record["warnings"].append(warning)
+        if not record["lint"]:
+            record["lint"] = doc.get("lint") or []
 
     record["ok"] = bool(record["nodes"])
     if not record["ok"] and not record["error"]:
@@ -210,17 +215,23 @@ def write_index(results, out_root, started):
             for n in r["nodes"]) or "&mdash;"
         gaps = "".join('<li><code>${%s}</code></li>' % _esc(t)
                        for t in r["unresolved"][:12]) or ""
+        lint = r.get("lint") or []
+        errors = sum(1 for f in lint if f["severity"] == "error")
+        lint_cell = ('<a href="lint.html#%s">%d finding%s%s</a>' % (
+            _esc(r["activity"]), len(lint), "" if len(lint) == 1 else "s",
+            (", <b>%d error%s</b>" % (errors, "" if errors == 1 else "s")) if errors else "")
+            if lint else "&mdash;")
         warn = "".join('<li>%s</li>' % _esc(w) for w in r["warnings"][:8]) or ""
         rows.append(
             '<tr class="%s"><td>%s<div class="k">%s</div></td>'
             '<td>%s</td><td>%s</td><td class="n">%s</td><td class="n">%s</td>'
-            '<td>%s</td><td><ul>%s%s</ul>%s</td></tr>' % (
+            '<td>%s</td><td>%s</td><td><ul>%s%s</ul>%s</td></tr>' % (
                 status, _esc(r["activity"]),
                 _esc(r["mapping"] or "no mapping"),
                 ('<span class="pill p-%s">%s</span>' %
                  ("syn" if r["ciqSynthetic"] else "real",
                   "synthesised" if r["ciqSynthetic"] else "real order")),
-                _esc(r["ciq"] or ""), r["steps"], r["interactive"], docs,
+                _esc(r["ciq"] or ""), r["steps"], r["interactive"], docs, lint_cell,
                 gaps, warn,
                 ('<div class="bad">%s</div>' % _esc(r["error"])) if r["error"] else ""))
 
@@ -233,6 +244,24 @@ def write_index(results, out_root, started):
                                                   sum(len(r["nodes"]) for r in results),
                                                   sum(r["steps"] for r in results)))
     io.open(os.path.join(out_root, "index.html"), "w", encoding="utf-8",
+            newline="\n").write(html)
+    write_lint(results, out_root)
+
+
+def write_lint(results, out_root):
+    """lint.html - every finding, per workflow, next to the index."""
+    blocks = []
+    for r in results:
+        lint = r.get("lint") or []
+        items = "".join('<li class="%s"><b>%s</b> <code>%s</code> %s%s</li>' % (
+            _esc(f["severity"]), _esc(f["severity"]), _esc(f["rule"]), _esc(f["message"]),
+            (' <span class="k">%s</span>' % _esc(f["where"])) if f.get("where") else "")
+            for f in lint) or '<li class="k">nothing to report</li>'
+        blocks.append('<h2 id="%s">%s <span class="k">%d finding%s</span></h2><ul>%s</ul>' % (
+            _esc(r["activity"]), _esc(r["activity"]), len(lint),
+            "" if len(lint) == 1 else "s", items))
+    html = _LINT_HTML.replace("{{BLOCKS}}", "\n".join(blocks))
+    io.open(os.path.join(out_root, "lint.html"), "w", encoding="utf-8",
             newline="\n").write(html)
 
 
@@ -281,13 +310,36 @@ code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
 <div class="sub">{{SUMMARY}} &middot; generated {{GENERATED}}</div>
 <table><thead><tr><th>Activity</th><th>Order data</th><th>CIQ</th>
 <th class="n">Steps</th><th class="n">Interactive</th><th>Documents</th>
-<th>Unresolved references</th></tr></thead>
+<th>Template findings</th><th>Unresolved references</th></tr></thead>
 <tbody>
 {{ROWS}}
 </tbody></table>
 <p class="k">A synthesised order stands in for a real CIQ so the workflow can be
 walked; the values in those documents are made up, and each one says so in its
 <code>meta.generatedBy</code>.</p>
+</div></body></html>
+"""
+
+
+_LINT_HTML = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Template findings</title>
+<style>
+:root{--bg:#f6f7f9;--ink:#1b1f24;--muted:#5b6673;--bad:#b4232a;--warn:#8a5a00}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#12161b;--ink:#e6edf3;
+ --muted:#9aa7b4;--bad:#ff8d8d;--warn:#ffcc66}}
+body{margin:0;background:var(--bg);color:var(--ink);
+ font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+.wrap{max-width:1100px;margin:0 auto;padding:22px 16px 60px}
+h1{font-size:20px}h2{font-size:15px;margin:22px 0 6px}.k{color:var(--muted);font-size:12px;font-weight:400}
+li{margin:3px 0;font-size:13px}li.error b{color:var(--bad)}li.warning b{color:var(--warn)}
+code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
+</style></head><body><div class="wrap">
+<h1>Template findings</h1>
+<p class="k">What the engine will do with each workflow that its author did not mean - from
+<code>python lint.py</code>. <a href="index.html">back to the index</a></p>
+{{BLOCKS}}
 </div></body></html>
 """
 
@@ -336,6 +388,17 @@ def main(argv=None):
     for directory in (out_root, ciq_root):
         if not os.path.isdir(directory):
             os.makedirs(directory)
+    if not args.only:
+        # a workflow deleted from templates/yaml must not leave its documents
+        # behind looking current
+        wanted = set(os.path.splitext(f)[0] for f in workflows)
+        for entry in os.listdir(out_root):
+            full = os.path.join(out_root, entry)
+            if os.path.isdir(full) and not entry.startswith("_") and entry not in wanted:
+                shutil.rmtree(full)
+        for entry in os.listdir(ciq_root):
+            if entry.endswith(".json") and os.path.splitext(entry)[0] not in wanted:
+                os.remove(os.path.join(ciq_root, entry))
 
     extra = []
     for item in args.param:
@@ -379,8 +442,9 @@ def main(argv=None):
                 continue
 
         out_dir = os.path.join(out_root, stem)
-        if not os.path.isdir(out_dir):
-            os.makedirs(out_dir)
+        if os.path.isdir(out_dir):
+            shutil.rmtree(out_dir)                    # no document of a node that is gone
+        os.makedirs(out_dir)
         record = run_one(yaml_path, mapping, ciq_path, out_dir, synthetic, extra)
         results.append(record)
         _log(record, args.quiet)

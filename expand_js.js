@@ -19,14 +19,15 @@ const path = require("path");
 const vm = require("vm");
 
 const TEMPLATE = path.join(__dirname, "template");
-const PARTS = ["engine.js", "synth.js", "expander.js"];
+const PARTS = ["engine.js", "synth.js", "expander.js", "runtime.js", "lint.js", "report.js"];
 
 /** The browser API, loaded the way the browser loads it. */
 function loadApi() {
   const source = PARTS.map(f => fs.readFileSync(path.join(TEMPLATE, f), "utf8")).join("\n\n") +
     "\n;globalThis.__API__ = { Expander, OutputTemplate, normalizeCiq, impliedValues," +
     " renderModeFor, DEFAULT_PARAMS, successOutput, failureOutput, sampleFor," +
-    " interpolate, evalCond, applyRegisters, evalCriteria, resolveName };\n";
+    " interpolate, evalCond, applyRegisters, evalCriteria, resolveName," +
+    " simulate, divergence, labelOf, activityParams, lintWorkflow, buildReport, buildLog };\n";
 
   const sandbox = {
     console, JSON, Math, Date, RegExp, Object, Array, String, Number, Boolean,
@@ -98,6 +99,9 @@ function main() {
     params: params,
     steps: expansion.steps,
     warnings: expansion.warnings,
+    phases: expansion.phases,
+    loops: expansion.loops,
+    lint: api.lintWorkflow(workflow, data, params),
   }, null, 2));
 }
 

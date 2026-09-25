@@ -183,8 +183,28 @@ def _synth(column, index, scope, demand, hint=""):
     if words & {"ACTION"}:
         return "ENABLE"
     if words & {"NODE", "NODENAME"}:
-        return group
+        # one name per node: the engine selects a node BY NAME, so two
+        # entries called North1 are one node and a document that overwrites
+        return group if index == 0 else "%s-%d" % (group, n)
     return "%s_%d" % (re.sub(r"[^A-Za-z0-9]+", "_", column).strip("_") or "VALUE", n)
+
+
+def _put(row, column, value):
+    """
+    Set one record field. A dotted column - `${record.data.conditions.appId.value}`
+    - is a NESTED field: resolvePath() splits on the dots, so a flat key
+    "conditions.appId.value" would never be found.
+    """
+    parts = [p for p in column.split(".") if p]
+    if len(parts) < 2 or " " in column:
+        row.setdefault(column, value)
+        return
+    current = row
+    for part in parts[:-1]:
+        if not isinstance(current.get(part), dict):
+            current[part] = {}
+        current = current[part]
+    current.setdefault(parts[-1], value)
 
 
 def _alias_value(alias, index, scope, demand):
@@ -342,7 +362,8 @@ class Generator(object):
         index = scope.get("__index__", 0)
         row = {}
         for column in self.demand.columns:
-            row[column] = _synth(column, index, scope, self.demand)
+            _put(row, column, _synth(column.rsplit(".", 1)[-1] if "." in column else column,
+                                     index, scope, self.demand))
         sheet = scope.get("__sheet__")
         for column in self.template.columns_for(sheet) if sheet else []:
             row.setdefault(column, _synth(column, index, scope, self.demand))
@@ -447,9 +468,11 @@ def minimal(workflow, groups=2, rows=2, activity=None, node_type=None):
             for index in range(max(1, rows)):
                 inner = dict(scope)
                 inner["__index__"] = index
-                records.append({"data": dict(
-                    (column, _synth(column, index, inner, demand))
-                    for column in demand.columns)})
+                data = {}
+                for column in demand.columns:
+                    _put(data, column, _synth(column.rsplit(".", 1)[-1] if "." in column
+                                              else column, index, inner, demand))
+                records.append({"data": data})
             tables.append({"table": table, "records": records})
 
     node_groups = []

@@ -47,9 +47,14 @@ def read_json(path):
         return json.load(handle)
 
 
+# libyaml parses these 400 KB workflows ten times faster than the pure-python
+# scanner, and reads them identically.
+_SAFE_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+
+
 def read_yaml(path):
     with io.open(path, encoding="utf-8") as handle:
-        return yaml.safe_load(handle)
+        return yaml.load(handle, Loader=_SAFE_LOADER)
 
 
 def extract_data_section(payload):
@@ -333,6 +338,13 @@ def load_output_template(path):
 # The macro-server Arglist values a real run supplies. Defaults mirror
 # SimActivityRunner.java so a generated MOP is runnable against the simulator
 # without a params file; every one of them stays overridable in the page.
+#
+# The first seven are the order's own. The rest are what a real run puts in
+# scope besides: CliAutomationEngine.extractArglistVariables() turns EVERY
+# Arglist argument into a variable (INPUT_JSON_FILE_NAME, the report paths,
+# SUB_ACTIVITY_NAME ...), and MopExecutionUtil adds the GRC-section values
+# (REPO_*, NIAM_IP, M2MPORT) and the M2M login. Without them ${REPO_USER} and
+# friends came out blank in almost every document.
 DEFAULT_PARAMS = {
     "ORDER_NO": "12345",
     "PARENT_REQ_ID": "12345",
@@ -341,7 +353,73 @@ DEFAULT_PARAMS = {
     "CR_NAME": "CR1",
     "NODE_TYPE": "PGW_RDS",
     "REQ_TYPE": "1",
+    "SUB_ACTIVITY_NAME": "",
+    "ROLLBACK_ONLY": "false",
+    "INPUT_JSON_FILE_NAME": "/opt/clicr/input/order.json",
+    "OUTPUT_LOGS_FILE_LOCATION": "/opt/clicr/runs/10057/reports/logs",
+    "OUTPUT_JSON_REPORT_NAME": "/opt/clicr/runs/10057/reports/json",
+    "MOP_EXEC_LOG_FILE": "/opt/clicr/runs/10057/reports/logs/execution.log",
+    "REPO_IP": "127.0.0.1",
+    "REPO_USER": "installer",
+    "REPO_PASSWORD": "ROOT",
+    "NIAM_IP": "127.0.0.1",
+    "M2MPORT": "22",
+    "M2MUSER": "admin",
+    "M2MPASSWORD": "admin",
 }
+
+
+def activity_params(stem, data, ciq_name=None):
+    """
+    NODE_TYPE, SUB_ACTIVITY_NAME and INPUT_JSON_FILE_NAME for one activity.
+
+    MopExecutionUtil loads `<NODE_TYPE>_<SUB_ACTIVITY_NAME>.yaml`, so the node
+    type is what is left of the file name once the CIQ's activity is taken off
+    the end: PGW_RDS_1051_SUBSCRIBER_PROFILE_CONFIGURATION with activity
+    1051_SUBSCRIBER_PROFILE_CONFIGURATION is PGW_RDS. The old default claimed
+    PGW_RDS for every SBC, DSR and EIR document.
+    """
+    out = {}
+    activity = str((data or {}).get("activity") or "").strip()
+    node_type = str((data or {}).get("nodeType") or "").strip()
+    stem = re.sub(r"\.ya?ml$", "", str(stem or ""), flags=re.I)
+    if activity and stem.upper().endswith("_" + activity.upper()):
+        node_type = stem[:len(stem) - len(activity) - 1]
+    if not node_type and stem:
+        node_type = stem.split("_")[0]
+    if node_type:
+        out["NODE_TYPE"] = node_type
+    if activity:
+        out["SUB_ACTIVITY_NAME"] = activity
+    if ciq_name:
+        out["INPUT_JSON_FILE_NAME"] = "/opt/clicr/input/" + ciq_name
+    return out
+
+
+def explicit_keys(path=None, overrides=None):
+    """The parameter names the caller set on purpose - they beat activity_params."""
+    keys = set(_file_params(path)) if path else set()
+    for item in overrides or []:
+        if "=" in item:
+            keys.add(item.split("=", 1)[0].strip())
+    return keys
+
+
+def _file_params(path):
+    """A params file: JSON ({"ORDER_NO": "12345"}) or key=value lines."""
+    out = {}
+    text = io.open(path, encoding="utf-8").read().strip()
+    if text.startswith("{"):
+        for key, value in json.loads(text).items():
+            out[str(key)] = "" if value is None else str(value)
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        out[key.strip()] = value.strip()
+    return out
 
 
 def load_params(path=None, overrides=None):
@@ -352,17 +430,7 @@ def load_params(path=None, overrides=None):
     """
     params = dict(DEFAULT_PARAMS)
     if path:
-        text = io.open(path, encoding="utf-8").read().strip()
-        if text.startswith("{"):
-            params.update(dict((str(k), "" if v is None else str(v))
-                               for k, v in json.loads(text).items()))
-        else:
-            for line in text.splitlines():
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, value = line.split("=", 1)
-                params[key.strip()] = value.strip()
+        params.update(_file_params(path))
     for item in overrides or []:
         if "=" in item:
             key, value = item.split("=", 1)

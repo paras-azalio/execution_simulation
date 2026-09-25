@@ -67,7 +67,22 @@ function resolveName(name, vars){
     const m = /^(.*?)\[(\d+)\]$/.exec(part);
     if(m){ part=m[1]; idx=parseInt(m[2],10); }
     if(part){
-      if(cur && typeof cur==="object" && !Array.isArray(cur) && part in cur) cur=cur[part];
+      if(cur && typeof cur==="object" && !Array.isArray(cur)){
+        if(part in cur) cur=cur[part];
+        else {
+          /* resolvePath(): a missing key falls back to the ONE key ending in
+             ".<part>"; two such keys and the lookup gives up. */
+          const hits = Object.keys(cur).filter(k => k.endsWith("." + part));
+          if(hits.length!==1) return undefined;
+          cur = cur[hits[0]];
+        }
+      }
+      else if(Array.isArray(cur) && /^\d+$/.test(part)){
+        /* resolvePath() indexes a list with a DOTTED number: hosts.0 */
+        const i = parseInt(part,10);
+        if(i>=cur.length) return undefined;
+        cur = cur[i];
+      }
       else return undefined;
     }
     if(idx!==null){
@@ -216,71 +231,269 @@ function compileRe(pattern, extra){
   try { return new RegExp(t.source, flags); } catch(e){ return null; }
 }
 
+/* ResultProcessor.tryResolveGroupName(): the i-th CAPTURING group gets the
+ * i-th NAME in the pattern text, so an unnamed group ahead of a named one
+ * shifts the names - a real engine quirk, reproduced on purpose. */
+const GROUP_NAME_RE = /\(\?P?<([a-zA-Z][a-zA-Z0-9_]*)>/g;
+function groupNamesOf(pattern){
+  const out=[]; let m; const re=new RegExp(GROUP_NAME_RE.source,"g");
+  while((m=re.exec(String(pattern||"")))) out.push(m[1]);
+  return out;
+}
+
+/* java.util.regex refuses a '{' that is not a {n,m} quantifier and a group
+ * name with '_' in it; python and JS accept both, so the page has to say no
+ * where the engine would. */
+function javaRegexError(pattern){
+  const text = String(pattern||"");
+  for(const name of groupNamesOf(text)){
+    if(name.indexOf("_")>=0) return "group name <"+name+"> contains '_', which java.util.regex rejects";
+  }
+  const stripped = text.replace(/\[(?:\\.|[^\]\\])*\]/g, "");
+  if(/(^|[^\\])\{(?!\d+(?:,\d*)?\})/.test(stripped))
+    return "a '{' that is not a {n,m} quantifier (Illegal repetition)";
+  return null;
+}
+
+/* Pattern.compile(p, Pattern.MULTILINE) - how both captureVariables() and
+ * regexMatches() compile. Returns null for anything java would reject. */
+function compileJava(pattern, extra){
+  if(javaRegexError(pattern)) return null;
+  return compileRe(pattern, "m"+(extra||""));
+}
+
+/**
+ * ResultProcessor.captureVariables(), including the parts that surprise:
+ * the regex is interpolated first, compiled MULTILINE, the LAST match wins,
+ * no match clears the named groups to "", every group of a loop register is
+ * numbered, and a name entry's `when` gates only the name - never the regex.
+ */
 function applyRegisters(register, output, vars, log){
-  output = output||"";
+  output = (output===null||output===undefined) ? "" : String(output);
   for(const entry of register||[]){
-    if(!entry) continue;
+    if(!entry || typeof entry!=="object") continue;
+    if(entry.regex!==undefined && entry.regex!==null){
+      const resolved = interpolate(String(entry.regex), vars);
+      const names = groupNamesOf(resolved);
+      const re = compileJava(resolved, "g");
+      if(!re){
+        if(log) log.push({name:entry.regex, value:null,
+                          source:"bad regex: "+(javaRegexError(resolved)||"does not compile")});
+      } else {
+        const loop = !!entry.loop;
+        let index = (typeof entry.start_index==="number") ? entry.start_index : 1;
+        let count = 0, groups = 0;
+        for(const m of output.matchAll(re)){
+          count++;
+          groups = m.length-1;
+          for(let i=1;i<m.length;i++){
+            const name = names[i-1];
+            if(!name) continue;
+            const key = loop ? name+"_"+index : name;
+            if(m[i]===undefined) delete vars[key];           // putVariable(k, null)
+            else vars[key] = m[i];
+            if(log) log.push({name:key, value:m[i]===undefined?null:m[i],
+                              source:"captured by "+entry.regex});
+          }
+          if(loop) index++;
+        }
+        if(count===0 && !loop){
+          /* groupCount() of the pattern - a throwaway match against "" is not
+             possible for every pattern, so count the capturing groups the way
+             the source declares them */
+          const total = new RegExp(re.source+"|", re.flags.replace("g","")).exec("").length-1;
+          for(let i=1;i<=total;i++){
+            const name = names[i-1];
+            if(!name) continue;
+            vars[name] = "";
+            if(log) log.push({name:name, value:null, source:'no match in output - cleared to ""'});
+          }
+        }
+        if(loop && entry.count_var){
+          vars[entry.count_var]=String(count);
+          if(log) log.push({name:entry.count_var,value:String(count),source:"loop count over "+entry.regex});
+        }
+      }
+    }
+    const name = entry.name;
+    if(!name || !String(name).trim()) continue;
     if(entry.when!==undefined && entry.when!==null && !evalCond(entry.when,vars)){
-      if(log) log.push({name:entry.name||entry.regex, value:null, source:"skipped: when is false"});
+      if(log) log.push({name:name, value:null, source:"skipped: when is false"});
       continue;
     }
-    if(entry.regex){
-      const re = compileRe(entry.regex, entry.loop?"g":"");
-      if(!re){ if(log) log.push({name:entry.regex,value:null,source:"bad regex"}); continue; }
-      if(entry.loop){
-        /* ResultProcessor: a loop register names its captures NAME_1..NAME_n
-           and counts them. engine.py sets those numbered variables too, and a
-           workflow reads them (${XMLNAME_1}), so the mirror has to as well. */
-        const hits = Array.from(output.matchAll(re));
-        const base = (function(){
-          const m = /\(\?P?<([A-Za-z][A-Za-z0-9]*)>/.exec(entry.regex||"");
-          return m ? m[1] : "MATCH";
-        })();
-        hits.forEach((hit, i)=>{
-          const text = hit.groups ? (Object.values(hit.groups)[0]||"")
-                     : (hit[1]!==undefined ? hit[1] : hit[0]);
-          vars[base+"_"+(i+1)] = text||"";
-        });
-        if(entry.count_var){
-          vars[entry.count_var]=String(hits.length);
-          if(log) log.push({name:entry.count_var,value:String(hits.length),source:"loop count"});
-        }
-        continue;
-      }
-      const m = re.exec(output);
-      if(!m){ if(log) log.push({name:entry.regex,value:null,source:"no match in output"}); continue; }
-      if(m.groups){
-        for(const g in m.groups){
-          vars[g]=m.groups[g]||"";
-          if(log) log.push({name:g,value:vars[g],source:"captured"});
-        }
-      }
-      continue;
-    }
-    if(entry.name){
-      vars[entry.name]=interpolate(entry.value===undefined?"":entry.value, vars);
-      if(log) log.push({name:entry.name,value:vars[entry.name],source:"set from value"});
-    }
+    if(entry.value===undefined || entry.value===null) continue;
+    vars[name] = interpolateObject(entry.value, vars);
+    if(log) log.push({name:name, value:stringify(vars[name]), source:"set from value"});
   }
 }
 
-/* criteria evaluation - SuccessCriteria: exit_code / http_status /
-   transfer_status / regex / expr / all[] / any[] */
-function evalCriteria(crit, vars, output, exitCode){
-  if(!crit || typeof crit!=="object") return true;
-  const checks=[];
-  if("exit_code" in crit) checks.push(String(exitCode)===String(crit.exit_code));
-  if("http_status" in crit) checks.push(true);
-  if("transfer_status" in crit) checks.push(true);
-  if(typeof crit.regex==="string"){
-    const re = compileRe(crit.regex, "");
-    checks.push(re ? re.test(output||"") : false);
+/** ExecutionContext.interpolateObject(): strings, maps and lists, recursively. */
+function interpolateObject(value, vars){
+  if(typeof value==="string") return interpolate(value, vars);
+  if(Array.isArray(value)) return value.map(v=>interpolateObject(v, vars));
+  if(value && typeof value==="object"){
+    const out={}; for(const k of Object.keys(value)) out[k]=interpolateObject(value[k], vars);
+    return out;
   }
-  if(typeof crit.expr==="string" && crit.expr.trim()) checks.push(evalCond(crit.expr,vars));
-  if(Array.isArray(crit.all)) checks.push(crit.all.every(c=>evalCriteria(c,vars,output,exitCode)));
-  if(Array.isArray(crit.any)) checks.push(crit.any.some(c=>evalCriteria(c,vars,output,exitCode)));
-  if(!checks.length) return true;
-  return checks.every(Boolean);
+  return value;
+}
+
+/* ===================================================================== *
+ *  criteria - ResultProcessor.isSuccess()
+ * ===================================================================== */
+/** regexMatches(): Pattern.compile(p, MULTILINE).matcher(output).find(). */
+function regexMatches(pattern, output){
+  if(output===null||output===undefined) return false;
+  const re = compileJava(String(pattern));
+  return re ? re.test(output) : false;
+}
+
+/** safeEquals(String.valueOf(expected), String.valueOf(actual)). */
+function attrText(v){
+  if(v===null||v===undefined) return "null";
+  if(typeof v==="boolean") return v?"true":"false";
+  return String(v);
+}
+
+/* The protocol attributes the java reads. A bare number is the exit code -
+ * the shape every caller used before REST steps carried a status. */
+function asAttrs(a){
+  if(a===null||a===undefined) return {};
+  if(typeof a==="object") return a;
+  return { exit_code: a };
+}
+
+/** matchesCondition(): an all[]/any[] item is NOT a nested criteria block. A
+ *  `regex` is matched; every other key is compared to the RESULT ATTRIBUTE of
+ *  that name - so an `expr:` inside all[] is always false. */
+function matchesCondition(cond, output, attrs){
+  if(!cond || typeof cond!=="object" || !Object.keys(cond).length) return true;
+  if(cond.regex!==undefined && cond.regex!==null) return regexMatches(cond.regex, output);
+  for(const k of Object.keys(cond)){
+    if(attrText(cond[k])!==attrText(attrs[k])) return false;
+  }
+  return true;
+}
+
+/* criteria evaluation - SuccessCriteria: exit_code / regex / expr /
+   http_status / transfer_status / all[] / any[] */
+function evalCriteria(crit, vars, output, attrsIn){
+  const attrs = asAttrs(attrsIn);
+  if(crit===null||crit===undefined){
+    return attrs.exit_code===undefined || attrs.exit_code===null || String(attrs.exit_code)==="0";
+  }
+  if(typeof crit!=="object") return true;
+  if(crit.exit_code!==undefined && crit.exit_code!==null){
+    if(attrs.exit_code===undefined||attrs.exit_code===null||String(attrs.exit_code)!==String(crit.exit_code)) return false;
+  }
+  if(crit.regex!==undefined && crit.regex!==null && !regexMatches(crit.regex, output)) return false;
+  if(typeof crit.expr==="string" && crit.expr.trim() && !evalCond(crit.expr,vars)) return false;
+  if(crit.http_status!==undefined && crit.http_status!==null){
+    if(attrs.http_status===undefined||attrs.http_status===null||String(attrs.http_status)!==String(crit.http_status)) return false;
+  }
+  if(crit.transfer_status!==undefined && crit.transfer_status!==null){
+    if(attrText(crit.transfer_status)!==attrText(attrs.transfer_status)) return false;
+  }
+  if(Array.isArray(crit.all) && crit.all.length && !crit.all.every(c=>matchesCondition(c,output,attrs))) return false;
+  if(Array.isArray(crit.any) && crit.any.length && !crit.any.some(c=>matchesCondition(c,output,attrs))) return false;
+  return true;
+}
+
+/* ===================================================================== *
+ *  REST - RestProtocolPlugin
+ * ===================================================================== */
+/** The body as the plugin reads it: `\/` unescaped, then loaded. An empty body
+ *  is not an error - every json_path then falls back to its default. */
+function parseBody(body){
+  const text = String(body===null||body===undefined ? "" : body).replace(/\\\//g, "/");
+  if(!text.trim()) return { root: null, error: null };
+  try { return { root: JSON.parse(text), error: null }; } catch(e){ /* try YAML */ }
+  if(typeof jsyaml!=="undefined"){
+    try { return { root: jsyaml.load(text), error: null }; } catch(e){ /* reported */ }
+  }
+  return { root: null, error: "failed to parse response body for inline response_template" };
+}
+
+function splitPathTokens(body){
+  const out=[]; let buf="", depth=0;
+  for(const c of body){
+    if(c==="." && depth===0){ out.push(buf); buf=""; continue; }
+    if(c==="[") depth++; else if(c==="]") depth--;
+    buf+=c;
+  }
+  if(buf) out.push(buf);
+  return out;
+}
+
+function navigateToken(cur, token){
+  const at = token.indexOf("[");
+  const key = at<0 ? token : token.slice(0,at);
+  let pos = 0;
+  if(key){
+    if(!cur || typeof cur!=="object" || Array.isArray(cur)) return null;
+    cur = (key in cur) ? cur[key] : null;
+    pos = key.length;
+  }
+  while(pos<token.length){
+    if(token[pos]!=="[") return null;
+    const close = token.indexOf("]", pos);
+    if(close<0) return null;
+    const raw = token.slice(pos+1, close).trim();
+    if(!/^-?\d+$/.test(raw) || !Array.isArray(cur)) return null;
+    const i = parseInt(raw,10);
+    if(i<0 || i>=cur.length) return null;
+    cur = cur[i];
+    pos = close+1;
+  }
+  return cur===undefined ? null : cur;
+}
+
+/** evaluateJsonPath(): $, $.a.b, $.a[0].b, $.list.length() - nothing more. */
+function jsonPath(root, path){
+  if(root===null||root===undefined||path===null||path===undefined) return null;
+  path = String(path).trim();
+  if(!path) return null;
+  if(path==="$") return root;
+  if(!path.startsWith("$")) return null;
+  let body = path.slice(1);
+  if(body.startsWith(".")) body = body.slice(1);
+  let cur = root;
+  for(const token of splitPathTokens(body)){
+    if(!token) continue;
+    if(token==="length()"){
+      if(Array.isArray(cur) || typeof cur==="string") { cur = cur.length; continue; }
+      if(cur && typeof cur==="object") { cur = Object.keys(cur).length; continue; }
+      return null;
+    }
+    cur = navigateToken(cur, token);
+    if(cur===null||cur===undefined) return null;
+  }
+  return cur;
+}
+
+/** applyInlineResponseTemplate(). Returns the error the plugin would throw -
+ *  a missing `required` field, an unreadable body - or null. */
+function applyResponseTemplate(rules, body, vars, log){
+  if(!Array.isArray(rules)) return null;
+  const parsed = parseBody(body);
+  if(parsed.error) return parsed.error;
+  for(const rule of rules){
+    if(!rule || typeof rule!=="object") continue;
+    const name = interpolate(String(rule.name===undefined||rule.name===null?"":rule.name), vars);
+    if(!name.trim()) continue;
+    const path = interpolate(String(rule.json_path===undefined||rule.json_path===null?"":rule.json_path), vars);
+    let value = jsonPath(parsed.root, path);
+    let source = "json_path "+path;
+    if((value===null||value===undefined) && ("default" in rule)){
+      value = interpolateObject(rule["default"], vars);
+      source = "default (nothing at "+path+")";
+    }
+    if((value===null||value===undefined) && rule.required)
+      return "required response_template field missing: "+name+" path="+path;
+    if(value!==null && value!==undefined) vars[name] = value;
+    if(log) log.push({name:name, value:(value===null||value===undefined)?null:stringify(value), source:source});
+  }
+  return null;
 }
 
 
@@ -292,39 +505,53 @@ function evalCriteria(crit, vars, output, exitCode){
  * actively misleading where the only criterion is `exit_code: 0`, which any
  * pasted text satisfies. This returns the same verdict with every check that
  * produced it, so the page can show the operator what was actually tested. */
-function explainCriteria(crit, vars, output, exitCode, out){
+function explainCriteria(crit, vars, output, attrsIn, out){
   out = out || [];
+  const attrs = asAttrs(attrsIn);
+  const shown = v => (v===undefined||v===null) ? "none" : String(v);
   if(!crit || typeof crit!=="object" || !Object.keys(crit).length){
-    out.push({label:"no output criteria - this step is judged on its exit code alone",
-              ok:String(exitCode)==="0", detail:"exit code "+exitCode});
+    out.push({label:"no output criteria - this step is judged on whether the command itself succeeded",
+              ok:true, detail:attrs.http_status!==undefined ? "HTTP "+shown(attrs.http_status)
+                                                            : "exit code "+shown(attrs.exit_code)});
     return out;
   }
-  if("exit_code" in crit){
+  if(crit.exit_code!==undefined && crit.exit_code!==null){
     out.push({label:"exit code is "+crit.exit_code,
-              ok:String(exitCode)===String(crit.exit_code),
-              detail:"you gave "+exitCode});
+              ok:attrs.exit_code!==undefined && attrs.exit_code!==null &&
+                 String(attrs.exit_code)===String(crit.exit_code),
+              detail:"you gave "+shown(attrs.exit_code)});
   }
-  if("http_status" in crit) out.push({label:"HTTP status "+crit.http_status, ok:true,
-                                      detail:"not checked against pasted output"});
-  if("transfer_status" in crit) out.push({label:"transfer "+crit.transfer_status, ok:true,
-                                          detail:"not checked against pasted output"});
-  if(typeof crit.regex==="string"){
-    const re = compileRe(crit.regex, "");
+  if(crit.regex!==undefined && crit.regex!==null){
+    const why = javaRegexError(String(crit.regex));
     out.push({label:"output matches "+crit.regex,
-              ok: re ? re.test(output||"") : false,
-              detail: re ? "" : "the pattern does not compile"});
+              ok: regexMatches(crit.regex, output),
+              detail: why ? "java refuses this pattern: "+why : ""});
   }
   if(typeof crit.expr==="string" && crit.expr.trim()){
     const trace=[];
     const ok = evalCond(crit.expr, vars, trace);
     out.push({label:crit.expr, ok:ok, trace:trace});
   }
-  if(Array.isArray(crit.all)){
-    for(const item of crit.all) explainCriteria(item, vars, output, exitCode, out);
+  if(crit.http_status!==undefined && crit.http_status!==null){
+    out.push({label:"HTTP status is "+crit.http_status,
+              ok:attrs.http_status!==undefined && attrs.http_status!==null &&
+                 String(attrs.http_status)===String(crit.http_status),
+              detail:"got "+shown(attrs.http_status)});
   }
-  if(Array.isArray(crit.any)){
-    const inner=[];
-    for(const item of crit.any) explainCriteria(item, vars, output, exitCode, inner);
+  if(crit.transfer_status!==undefined && crit.transfer_status!==null){
+    out.push({label:"transfer status is "+crit.transfer_status,
+              ok:attrText(crit.transfer_status)===attrText(attrs.transfer_status),
+              detail:"got "+shown(attrs.transfer_status)});
+  }
+  const itemLabel = c => (c && c.regex!==undefined) ? "output matches "+c.regex
+    : Object.keys(c||{}).map(k=>k+" = "+attrText(c[k])+
+        (k==="expr" ? "  (compared as a result attribute - the engine never evaluates it)" : "")).join(", ");
+  if(Array.isArray(crit.all) && crit.all.length){
+    const inner = crit.all.map(c=>({label:itemLabel(c), ok:matchesCondition(c,output,attrs)}));
+    out.push({label:"all of these", ok:inner.every(c=>c.ok), children:inner});
+  }
+  if(Array.isArray(crit.any) && crit.any.length){
+    const inner = crit.any.map(c=>({label:itemLabel(c), ok:matchesCondition(c,output,attrs)}));
     out.push({label:"any of these", ok:inner.some(c=>c.ok), children:inner});
   }
   return out;
@@ -380,8 +607,10 @@ function resolveForEach(raw, vars){
 /* node (parity tests) picks these up; the browser ignores the export. */
 if (typeof module !== "undefined" && module.exports) {
   module.exports = { resolveName, interpolate, evalCond, applyRegisters,
-                     compileRe, tokensIn, whyUnresolved, resolveForEach,
-                     explainCriteria,
+                     compileRe, compileJava, javaRegexError, groupNamesOf,
+                     tokensIn, whyUnresolved, resolveForEach,
+                     explainCriteria, matchesCondition, regexMatches,
                      evalCriteria, splitTop, findOp, operand, cmpVals,
-                     stringify, pyDumps, toJsRegex };
+                     stringify, pyDumps, toJsRegex, interpolateObject,
+                     parseBody, jsonPath, applyResponseTemplate };
 }

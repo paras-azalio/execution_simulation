@@ -37,11 +37,14 @@ import re
 import sys
 
 import ciq as ciq_mod
+import lint as lint_mod
 from expander import Expander, INTERACTIVE
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE = os.path.join(HERE, "template", "runbook.html")
 ENGINE_JS = os.path.join(HERE, "template", "engine.js")
+RUNTIME_JS = os.path.join(HERE, "template", "runtime.js")
+REPORT_JS = os.path.join(HERE, "template", "report.js")
 UI_JS = os.path.join(HERE, "template", "ui.js")
 UI_CSS = os.path.join(HERE, "template", "ui.css")
 
@@ -169,7 +172,7 @@ def step_payload(step):
 
 
 def build_html(expansion, meta, base_vars, params, globals_vars,
-               template_html, assets):
+               template_html, assets, findings=None):
     payload = [step_payload(s) for s in expansion.steps]
     title = "MOP - %s - %s" % (meta.get("activity") or "activity", meta.get("node"))
     subtitle = " &middot; ".join(filter(None, [
@@ -185,11 +188,16 @@ def build_html(expansion, meta, base_vars, params, globals_vars,
     return (template_html
             .replace("{{UI_CSS}}", assets["css"])
             .replace("{{ENGINE_JS}}", assets["engine"])
+            .replace("{{RUNTIME_JS}}", assets["runtime"])
+            .replace("{{REPORT_JS}}", assets["report"])
             .replace("{{UI_JS}}", assets["ui"])
             .replace("{{TITLE}}", _esc(title))
             .replace("{{SUBTITLE}}", subtitle)
             .replace("{{META_JSON}}", _json(meta))
             .replace("{{STEPS_JSON}}", _json(payload))
+            .replace("{{PHASES_JSON}}", _json(expansion.phases))
+            .replace("{{LOOPS_JSON}}", _json(expansion.loops))
+            .replace("{{LINT_JSON}}", _json(findings or []))
             .replace("{{VARS_JSON}}", _json(base_vars))
             .replace("{{GLOBALS_JSON}}", _json(globals_vars))
             .replace("{{PARAMS_JSON}}", _json(params)))
@@ -241,12 +249,21 @@ def main(argv=None):
     data = ciq_mod.load_ciq(args.ciq)
     template = ciq_mod.load_output_template(args.json_template)
     params = ciq_mod.load_params(args.params, args.param)
+    # NODE_TYPE, SUB_ACTIVITY_NAME and INPUT_JSON_FILE_NAME follow the
+    # activity, unless the caller set them on purpose
+    explicit = ciq_mod.explicit_keys(args.params, args.param)
+    for key, value in ciq_mod.activity_params(os.path.basename(args.yaml), data,
+                                              os.path.basename(args.ciq)).items():
+        if key not in explicit:
+            params[key] = value
+    findings = [f.as_dict() for f in lint_mod.lint_file(args.yaml, data, params, workflow)]
 
     if not os.path.isfile(TEMPLATE):
         raise SystemExit("page template missing: %s" % TEMPLATE)
     template_html = io.open(TEMPLATE, encoding="utf-8").read()
     assets = {}
-    for key, path in (("engine", ENGINE_JS), ("ui", UI_JS), ("css", UI_CSS)):
+    for key, path in (("engine", ENGINE_JS), ("runtime", RUNTIME_JS), ("report", REPORT_JS),
+                      ("ui", UI_JS), ("css", UI_CSS)):
         if not os.path.isfile(path):
             raise SystemExit("page asset missing: %s" % path)
         assets[key] = io.open(path, encoding="utf-8").read()
@@ -279,8 +296,20 @@ def main(argv=None):
         log("mapping  : %s  (%d sheet%s)" % (
             os.path.basename(args.json_template), len(template.sheet_columns),
             "" if len(template.sheet_columns) == 1 else "s"), args.quiet)
+    if findings:
+        log("lint     : %d finding(s), %d error(s) - python lint.py %s" % (
+            len(findings), sum(1 for f in findings if f["severity"] == "error"),
+            os.path.basename(args.yaml)), args.quiet)
 
+    seen = set()
     for node in nodes:
+        key = (str(node.get("node") or node.get("nodeGroup")), str(node.get("crGroup")))
+        if key in seen:
+            # the engine picks the FIRST node of a name (CliAutomationEngine),
+            # and a second document would overwrite the first one's file
+            log("  %-28s skipped: a second node of the same name and crGroup" % key[0], args.quiet)
+            continue
+        seen.add(key)
         expander = Expander(workflow, data, params, template, tracer)
         expansion = expander.expand(node)
         meta = dict(expansion.node)
@@ -292,7 +321,7 @@ def main(argv=None):
 
         base_vars = _display_vars(expander, node)
         html = build_html(expansion, meta, base_vars, params,
-                          _globals_vars(workflow), template_html, assets)
+                          _globals_vars(workflow), template_html, assets, findings)
         name = "mop_%s_%s_%s" % (_slug(activity), _slug(meta.get("crGroup")),
                                  _slug(meta.get("node")))
         path = os.path.join(args.out, name + ".html")
@@ -300,7 +329,8 @@ def main(argv=None):
         written.append(path)
 
         interactive = sum(1 for s in expansion.steps if s.render_mode == INTERACTIVE)
-        unresolved = sorted(set(u.token for s in expansion.steps for u in s.unresolved or []))
+        unresolved = sorted(set(u.token for s in expansion.steps for u in s.unresolved or []
+                                if not getattr(u, "runtime", False)))
         log("  %-28s %3d steps (%d interactive, %d checklist)%s"
             % (meta.get("node"), len(expansion.steps), interactive,
                len(expansion.steps) - interactive,
@@ -314,6 +344,11 @@ def main(argv=None):
                 json.dumps({"meta": meta, "params": params,
                             "mapping": template.as_dict(),
                             "steps": [step_payload(s) for s in expansion.steps],
+                            "phases": expansion.phases,
+                            "loops": expansion.loops,
+                            "vars": base_vars,
+                            "globals": _globals_vars(workflow),
+                            "lint": findings,
                             "warnings": expansion.warnings},
                            ensure_ascii=False, indent=2, default=str))
             written.append(jpath)

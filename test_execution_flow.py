@@ -167,12 +167,34 @@ class ForEachAndRegisters(unittest.TestCase):
                                "count_var": "N"}], "line 1\nline 2\nline 3")
         self.assertEqual(c.get("N"), "3")
 
-    def test_loop_register_without_multiline_finds_nothing(self):
-        """Not a bug to fix: java's Pattern behaves the same way."""
+    def test_every_register_is_multiline(self):
+        """captureVariables() compiles with Pattern.MULTILINE, (?m) or not."""
         c = E.Context({})
         E.apply_registers(c, [{"regex": r"^line \d$", "loop": True,
                                "count_var": "N"}], "line 1\nline 2")
-        self.assertEqual(c.get("N"), "0")
+        self.assertEqual(c.get("N"), "2")
+
+    def test_the_last_match_wins(self):
+        """captureVariables() visits every match and keeps the last - so an
+        unanchored checksum regex keeps the last hex run of the FILE NAME."""
+        c = E.Context({})
+        E.apply_registers(c, [{"regex": r"(?<SUM>[a-f0-9]+)"}], "abc123  /storage/file")
+        self.assertEqual(c.get("SUM"), "e")
+
+    def test_no_match_clears_the_group(self):
+        c = E.Context({"X": "stale"})
+        E.apply_registers(c, [{"regex": r"^X=(?<X>.+)$"}], "nothing here")
+        self.assertEqual(c.get("X"), "")
+
+    def test_a_register_regex_is_interpolated(self):
+        c = E.Context({"IP": "10.0.0.7"})
+        E.apply_registers(c, [{"regex": r"(?<HIT>address ${IP})"}], "address 10.0.0.7 up")
+        self.assertEqual(c.get("HIT"), "address 10.0.0.7")
+
+    def test_java_rejects_what_python_forgives(self):
+        self.assertIsNotNone(E.java_regex_error("${NEW_FILE_NAME}"))
+        self.assertIsNotNone(E.java_regex_error("(?<A_B>x)"))
+        self.assertIsNone(E.java_regex_error(r"\d{2,3}[{}]"))
 
     def test_register_when_gates_the_set(self):
         c = E.Context({"LOGIN": "no"})
@@ -306,11 +328,18 @@ class RealWorkflow(unittest.TestCase):
         self.assertTrue(all(s.skip_state is False
                             for s in self.steps if not s.skip_when))
 
+    def login_steps(self, token):
+        """The login-detection steps, found by what they send - not by uid,
+        which moves every time the template gains or loses a step."""
+        return [s for s in self.steps if s.send == "echo %s_LOGIN_OK" % token]
+
     def test_login_detection_resolves_to_the_first_node(self):
         """niamID-1 answers, so 2 and 3 are skipped - as the engine would."""
-        self.assertEqual(self.by_uid("s0002").node_target, "niam_rds_1")
-        self.assertIs(self.by_uid("s0003").when_state, False)
-        self.assertIs(self.by_uid("s0004").when_state, False)
+        rds = self.login_steps("RDS")[:3]
+        self.assertEqual([s.node_target for s in rds], ["niam_rds_1", "niam_rds_2", "niam_rds_3"])
+        self.assertIs(rds[0].when_state, True)
+        self.assertIs(rds[1].when_state, False)
+        self.assertIs(rds[2].when_state, False)
 
     def test_later_steps_target_the_detected_node(self):
         targets = set(s.node_target for s in self.steps
@@ -955,6 +984,313 @@ class LenientYamlLoading(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, text)
         self.assertEqual(text, "1")
 
+
+# --------------------------------------------------------------------------- #
+#  what the engine really does: criteria, REST, validation branches
+# --------------------------------------------------------------------------- #
+class EngineFidelity(unittest.TestCase):
+
+    def test_http_status_is_compared(self):
+        c = E.Context({})
+        self.assertTrue(E.eval_criteria({"http_status": 200}, c, "", {"http_status": 200}))
+        self.assertFalse(E.eval_criteria({"http_status": 200}, c, "", {"http_status": 401}))
+
+    def test_an_expr_inside_all_is_always_false(self):
+        """matchesCondition() compares every non-regex key to an ATTRIBUTE."""
+        c = E.Context({"A": "1"})
+        self.assertFalse(E.eval_criteria({"all": [{"expr": '${A == "1"}'}]}, c, "",
+                                         {"exit_code": 0}))
+        self.assertTrue(E.eval_criteria({"all": [{"exit_code": 0}, {"regex": "ok"}]}, c, "ok",
+                                        {"exit_code": 0}))
+
+    def test_response_template(self):
+        c = E.Context({})
+        err = E.apply_response_template(
+            c, [{"name": "T", "json_path": "$.data.token", "required": True},
+                {"name": "N", "json_path": "$.items.length()"},
+                {"name": "D", "json_path": "$.nope", "default": "d"}],
+            '{"data": {"token": "t\\/1"}, "items": [1, 2, 3]}')
+        self.assertIsNone(err)
+        self.assertEqual((c.get("T"), c.get("N"), c.get("D")), ("t/1", 3, "d"))
+        self.assertIn("required", E.apply_response_template(
+            E.Context({}), [{"name": "T", "json_path": "$.t", "required": True}], "{}"))
+
+    def test_suffix_key_and_dotted_index(self):
+        c = E.Context({"row": {"Report.Email": "e"}, "hosts": ["a", "b"]})
+        self.assertEqual(c.interpolate("${row.Email}|${hosts.1}"), "e|b")
+
+
+def _mini_workflow():
+    """An activity with a REST check, its 401 retry handler and a rollback -
+    the shape of DSR_10006, small enough to reason about."""
+    return {
+        "globals": {"vars": {"ROLLBACK_REQUIRED": "false", "ROLLBACK_ONLY": "false"},
+                    "defaults": {"on_failure": "stop"}},
+        "nodes": {"api": {"type": "rest", "rest": {"base_url": "https://dsr/api"}}},
+        "phases": {
+            "activity_configuration": {
+                "name": "ACTIVITY_CONFIGURATION", "on_failure": "stop",
+                "steps": [
+                    {"id": "check", "node": "api", "on_failure": {"run": ["step:retry"]},
+                     "rest": {"method": "GET", "path": "/tables/${table}",
+                              "response_template": [{"name": "found", "json_path": "$.status",
+                                                     "default": "false"}]},
+                     "validation": {"success": {"criteria": {"expr": '${http_status == "200"}'}},
+                                    "failure": {"vars": {"last_status": "${http_status}",
+                                                         "ROLLBACK_REQUIRED": "true"}}}},
+                    {"id": "retry", "node": "api", "when": '${last_status == "401"}',
+                     "rest": {"method": "GET", "path": "/tables/${table}"},
+                     "validation": {"success": {"criteria": {"expr": '${http_status == "200"}'},
+                                                "vars": {"ROLLBACK_REQUIRED": "false"}}}},
+                    {"id": "apply", "node": "local", "send": "echo apply"},
+                ]},
+            "rollback_configuration": {
+                "name": "ROLLBACK_CONFIGURATION", "when": '${ROLLBACK_REQUIRED == "true"}',
+                "steps": [{"id": "restore", "node": "local", "send": "echo restore"}]},
+        }}
+
+
+class ExpansionTables(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        data = {"nodes": [{"node": "N1", "nodeGroup": "G1"}], "table": "T1"}
+        cls.exp = Expander(_mini_workflow(), data, CIQ.load_params()).expand(data["nodes"][0])
+        cls.by = dict((s.step_id, s) for s in cls.exp.steps)
+
+    def test_a_rollback_phase_is_kept_though_it_is_off_on_the_happy_path(self):
+        self.assertIn("restore", self.by)
+        rb = [p for p in self.exp.phases if p["key"] == "rollback_configuration"][0]
+        self.assertIs(rb["when_state"], False)
+        self.assertTrue(rb["post_failure"])
+
+    def test_validation_vars_are_read_as_a_mapping(self):
+        v = self.by["check"].validation
+        self.assertEqual(v["branchVars"]["failure"]["ROLLBACK_REQUIRED"], "true")
+        self.assertEqual(v["varsOnSuccess"], {})
+        self.assertEqual(self.by["retry"].validation["varsOnSuccess"],
+                         {"ROLLBACK_REQUIRED": "false"})
+
+    def test_a_rest_step_renders_its_request(self):
+        step = self.by["check"]
+        self.assertEqual(step.kind, "rest")
+        self.assertEqual(step.send, "GET https://dsr/api/tables/T1")
+        self.assertEqual(step.success_status, 200)
+
+    def test_its_failure_is_the_status_its_handler_waits_for(self):
+        self.assertEqual(self.by["check"].failure_status, 401)
+
+    def test_on_failure_is_normalised(self):
+        self.assertEqual(self.by["check"].on_failure["mode"], "run")
+        self.assertEqual(self.by["check"].on_failure["run"], ["step:retry"])
+        self.assertIsNone(self.by["check"].on_failure["next"])
+
+    def test_java_step_ids(self):
+        from expander import assign_step_ids
+        wf = {"phases": {"p": {"steps": [{"send": "a"}, {"id": "auto_step_1", "send": "b"},
+                                         {"send": "c"}]}}}
+        ids = assign_step_ids(wf)
+        steps = wf["phases"]["p"]["steps"]
+        self.assertEqual([ids[id(s)] for s in steps], ["auto_step_2", "auto_step_1", "auto_step_3"])
+
+
+# --------------------------------------------------------------------------- #
+#  the run itself - runtime.js, headless
+# --------------------------------------------------------------------------- #
+_SIM = r"""
+const X=require('./expand_js.js');const api=X.loadApi();
+const inp=JSON.parse(require('fs').readFileSync(0,'utf8'));
+const ex=new api.Expander(inp.workflow,inp.data,inp.params,null);
+const e=ex.expand(inp.data.nodes[0]);
+const doc={steps:e.steps,phases:e.phases,loops:e.loops,vars:ex.baseContext(inp.data.nodes[0]),
+           globals:ex.globalsVars(),params:inp.params};
+const byId={};for(const s of e.steps)byId[s.step_id]=s.uid;
+const out=inp.scenarios.map(sc=>{const st={choices:{},custom:{},status:{},exit:{},timeout:{}};
+  for(const [id,c] of Object.entries(sc.choices||{})) st.choices[byId[id]]=c;
+  for(const [id,v] of Object.entries(sc.status||{})) st.status[byId[id]]=v;
+  for(const [id,v] of Object.entries(sc.custom||{})) st.custom[byId[id]]=v;
+  const r=api.simulate(doc,st,{strict:!!sc.strict});
+  const states={};for(const s of e.steps)states[s.step_id]=r.rt[s.uid].state;
+  return {states:states,summary:r.summary};});
+process.stdout.write(JSON.stringify(out));
+"""
+
+
+def simulate(workflow, data, scenarios):
+    node = shutil.which("node")
+    if not node:
+        raise unittest.SkipTest("node is not installed")
+    payload = json.dumps({"workflow": workflow, "data": data, "params": CIQ.load_params(),
+                          "scenarios": scenarios})
+    proc = subprocess.Popen([node, "-e", _SIM], cwd=HERE, stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out, err = proc.communicate(payload.encode("utf-8"))
+    if proc.returncode != 0:
+        raise AssertionError(err.decode("utf-8", "replace"))
+    return json.loads(out.decode("utf-8"))
+
+
+class FailureRouting(unittest.TestCase):
+    """A failure makes the steps that wait for it run - which the page did not."""
+
+    @classmethod
+    def setUpClass(cls):
+        data = {"nodes": [{"node": "N1", "nodeGroup": "G1"}], "table": "T1"}
+        cls.r = simulate(_mini_workflow(), data, [
+            {},
+            {"choices": {"check": "failure"}},
+            {"choices": {"check": "custom"}, "custom": {"check": "{}"}, "status": {"check": "500"}},
+        ])
+
+    def test_the_happy_path_skips_the_handler_and_the_rollback(self):
+        s = self.r[0]["states"]
+        self.assertEqual((s["retry"], s["restore"]), ("skipped", "skipped"))
+        self.assertEqual(s["apply"], "pending")
+
+    def test_a_401_runs_the_handler_and_the_engine_still_stops(self):
+        s = self.r[1]["states"]
+        self.assertEqual(s["check"], "failure")
+        self.assertEqual(s["retry"], "pending")          # it ran, assumed to succeed
+        self.assertEqual(s["apply"], "notrun")           # no `next: continue`
+        self.assertEqual(s["restore"], "skipped")        # the retry reset ROLLBACK_REQUIRED
+
+    def test_a_500_skips_the_handler_and_opens_the_rollback(self):
+        s = self.r[2]["states"]
+        self.assertEqual(s["retry"], "skipped")
+        self.assertEqual(s["apply"], "notrun")
+        self.assertEqual(s["restore"], "pending")
+        self.assertEqual(self.r[2]["summary"]["engine"]["ROLLBACK_REQUIRED"], "true")
+
+
+class PhaseLevelStop(unittest.TestCase):
+    """on_failure: stop on a phase - the rule, and where the engine misses it."""
+
+    WORKFLOW = {
+        "globals": {"defaults": {"on_failure": "stop"}},
+        "phases": {
+            # the 1051 shape: a nodeGroups loop around a nodes loop, both
+            # on_failure: continue
+            "preNodeHealthCheck": {"name": "PRE_NODE_HEALTH_CHECK", "on_failure": "stop", "steps": [
+                {"type": "loop", "id": "groups_loop", "for_each": ["g"], "item_var": "g",
+                 "on_failure": "continue", "steps": [
+                     {"type": "loop", "id": "nodes_loop", "for_each": ["a"], "item_var": "n",
+                      "on_failure": "continue",
+                      "steps": [{"id": "check", "node": "local", "send": "check ${n}"}]}]}]},
+            "activity_configuration": {"name": "ACTIVITY_CONFIGURATION", "steps": [
+                {"id": "apply", "node": "local", "send": "apply"}]},
+        }}
+
+    @classmethod
+    def setUpClass(cls):
+        data = {"nodes": [{"node": "N1", "nodeGroup": "G1"}]}
+        cls.r = simulate(cls.WORKFLOW, data, [
+            {"choices": {"check": "failure"}},
+            {"choices": {"check": "failure"}, "strict": True},
+        ])
+
+    def test_a_precheck_failure_stops_the_run_before_the_activity(self):
+        self.assertEqual(self.r[0]["states"]["apply"], "notrun")
+        self.assertEqual(self.r[0]["summary"]["status"], "FAIL")
+
+    def test_the_engine_as_written_goes_on_into_the_activity(self):
+        """phaseHadAnyFailure is set in the loop's own executeSteps() call and
+        never reaches the phase - the 2026-09-24 production report."""
+        self.assertEqual(self.r[1]["states"]["apply"], "pending")
+
+
+# --------------------------------------------------------------------------- #
+#  lint
+# --------------------------------------------------------------------------- #
+class Lint(unittest.TestCase):
+
+    def rules(self, workflow, **kw):
+        import lint
+        return [f.rule for f in lint.lint(workflow, **kw)]
+
+    def steps(self, *steps):
+        return {"nodes": {}, "phases": {"p": {"steps": list(steps)}}}
+
+    def test_a_shell_expansion_the_engine_swallows(self):
+        self.assertIn("shell-expansion", self.rules(self.steps(
+            {"node": "local", "send": 'printf "%s" "${MISMATCH# }"'})))
+
+    def test_criteria_that_cannot_fail(self):
+        self.assertIn("tautology", self.rules(self.steps(
+            {"node": "local", "send": "x", "validation": {"success": {"criteria": {
+                "expr": '${A == "" || A != ""}'}}}})))
+
+    def test_expr_inside_all(self):
+        self.assertIn("expr-in-all-any", self.rules(self.steps(
+            {"node": "local", "send": "x", "validation": {"success": {"criteria": {
+                "all": [{"expr": '${A != ""}'}]}}}})))
+
+    def test_run_without_next_and_a_missing_handler(self):
+        rules = self.rules(self.steps({"node": "local", "send": "x",
+                                       "on_failure": {"run": ["step:nope"]}}))
+        self.assertIn("run-without-next", rules)
+        self.assertIn("handler-not-found", rules)
+
+    def test_parentheses_and_the_exit_code_variable(self):
+        rules = self.rules(self.steps({"node": "local", "send": "x",
+                                       "when": '${(A == "1") && exitCode == 0}'}))
+        self.assertIn("parentheses", rules)
+        self.assertIn("exit-code-variable", rules)
+
+    def test_phase_stop_blind_spot(self):
+        wf = {"phases": {"pre": {"on_failure": "stop", "steps": [
+            {"type": "loop", "for_each": [1], "steps": [
+                {"type": "loop", "for_each": [1], "on_failure": "continue",
+                 "steps": [{"node": "local", "send": "x"}]}]}]}}}
+        self.assertIn("phase-stop-blind", self.rules(wf))
+
+    def test_use_exit_code_is_ignored_under_a_prompt_regex(self):
+        self.assertIn("use-exit-code-ignored", self.rules(self.steps(
+            {"node": "local", "send": "su -", "use_exit_code": True, "prompt_regex": "#"})))
+
+    def test_a_clean_step_is_clean(self):
+        self.assertEqual(self.rules(self.steps({"node": "local", "send": "echo ok"})), [])
+
+    def test_duplicate_keys(self):
+        import lint
+        self.assertEqual(len(lint.duplicate_keys("a:\n  b: 1\n  b: 2\n")), 1)
+
+
+# --------------------------------------------------------------------------- #
+#  what a real run puts in scope
+# --------------------------------------------------------------------------- #
+class RequestParameters(unittest.TestCase):
+
+    def test_the_injected_grc_values_are_there(self):
+        for key in ("REPO_IP", "REPO_USER", "INPUT_JSON_FILE_NAME", "OUTPUT_LOGS_FILE_LOCATION",
+                    "NIAM_IP", "M2MPORT", "ROLLBACK_ONLY"):
+            self.assertIn(key, CIQ.DEFAULT_PARAMS)
+
+    def test_node_type_follows_the_activity(self):
+        got = CIQ.activity_params("SBC_147_IP_POI_CONFIG_ISBC.yaml",
+                                  {"activity": "147_IP_POI_CONFIG_ISBC"}, "x.json")
+        self.assertEqual(got["NODE_TYPE"], "SBC")
+        self.assertEqual(got["SUB_ACTIVITY_NAME"], "147_IP_POI_CONFIG_ISBC")
+        self.assertEqual(got["INPUT_JSON_FILE_NAME"], "/opt/clicr/input/x.json")
+
+    def test_rollback_only_implies_rollback_required(self):
+        wf = {"globals": {"vars": {"ROLLBACK_REQUIRED": "false"}}, "phases": {}}
+        params = dict(CIQ.load_params(), ROLLBACK_ONLY="true")
+        ctx = Expander(wf, {}, params).base_context({"node": "N1"})
+        self.assertEqual(ctx.get("ROLLBACK_REQUIRED"), "true")
+
+
+class SynthesisedNestedFields(unittest.TestCase):
+
+    def test_a_dotted_record_field_is_nested(self):
+        wf = {"phases": {"p": {"steps": [{"node": "local",
+                                          "send": "x ${record.data.conditions.appId.value}"}]}}}
+        demand = ciqgen.demand_of(wf)
+        row = {}
+        for column in demand.columns:
+            ciqgen._put(row, column, "v")
+        self.assertEqual(row, {"conditions": {"appId": {"value": "v"}}})
+        ctx = E.Context({"record": {"data": row}})
+        self.assertEqual(ctx.interpolate("${record.data.conditions.appId.value}"), "v")
 
 if __name__ == "__main__":
     unittest.main()

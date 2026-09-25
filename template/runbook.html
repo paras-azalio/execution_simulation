@@ -16,14 +16,21 @@
 </div>
 
 <script>
+/* The page exactly as delivered, before anything is drawn into it - "Save
+   walked copy" writes this back out with the walk baked in. */
+const PRISTINE = "<!DOCTYPE html>\n" + document.documentElement.outerHTML;
+
 /* ===================================================================== *
  *  Data, emitted by mopgen.py
  * ===================================================================== */
 const META    = {{META_JSON}};
 const STEPS   = {{STEPS_JSON}};
+const PHASES  = {{PHASES_JSON}};   /* when / on_failure / then per phase */
+const LOOPS   = {{LOOPS_JSON}};    /* every loop instance: items and gates */
 const VARS0   = {{VARS_JSON}};
 const GLOBALS = {{GLOBALS_JSON}};   /* globals.vars as [name, raw], in order */
 const PARAMS  = {{PARAMS_JSON}};
+const LINT    = {{LINT_JSON}};
 
 /* ===================================================================== *
  *  Engine mirror - ExecutionContext semantics, in the browser.
@@ -36,6 +43,13 @@ const PARAMS  = {{PARAMS_JSON}};
 {{ENGINE_JS}}
 
 /* ===================================================================== *
+ *  The run - ExecutionOrchestrator's routing, and the report it leaves
+ * ===================================================================== */
+{{RUNTIME_JS}}
+
+{{REPORT_JS}}
+
+/* ===================================================================== *
  *  The document - the same renderer runner.html uses, so a MOP generated
  *  on the command line and a workflow dropped into the runner behave
  *  identically.
@@ -43,12 +57,17 @@ const PARAMS  = {{PARAMS_JSON}};
 {{UI_JS}}
 
 initDocument({
-  mount:   document.getElementById("app"),
-  meta:    META,
-  steps:   STEPS,
-  vars:    VARS0,
-  globals: GLOBALS,
-  params:  PARAMS,
+  mount:    document.getElementById("app"),
+  meta:     META,
+  steps:    STEPS,
+  phases:   PHASES,
+  loops:    LOOPS,
+  vars:     VARS0,
+  globals:  GLOBALS,
+  params:   PARAMS,
+  lint:     LINT,
+  pristine: PRISTINE,
+  seed:     readSeed(),
 });
 </script>
 </body>

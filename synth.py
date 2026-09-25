@@ -44,6 +44,7 @@ covers every pattern in the CLICR workflows; anything it cannot parse degrades
 to a marker line rather than raising.
 """
 
+import json
 import re
 
 import engine
@@ -53,6 +54,16 @@ _CLASS_SAMPLE = {
     "d": "7", "w": "x", "s": " ", "S": "x", "W": "-", "D": "x",
 }
 _MARKER = "<output not derivable from the criteria - use Custom>"
+MARKER = _MARKER
+
+# The statuses tried, in order, for a REST step's Failure - after any the
+# step's own on_failure handlers are waiting for.
+_FAIL_STATUSES = (500, 404, 401, 400, 503)
+
+
+def dumps(value):
+    """json.dumps as the page's pyDumps() writes it: ', ' and ': ' separators."""
+    return json.dumps(value, ensure_ascii=False)
 
 
 # --------------------------------------------------------------------------- #
@@ -259,11 +270,8 @@ def _passes(register, criteria, output, exit_code=0):
         return False
     pattern = (criteria or {}).get("regex")
     if isinstance(pattern, str) and pattern.strip():
-        try:
-            if not re.search(to_java_regex(pattern), output or ""):
-                return False
-        except re.error:
-            pass
+        if not engine.regex_matches(pattern, output or ""):
+            return False
     return True
 
 
@@ -333,6 +341,19 @@ def _build_success(step_register, criteria, implied, counts=None, loops="all"):
             if name in implied:
                 groups[name] = implied[name]
         line = sample_for(pattern, groups)
+        nonempty = _nonempty_names(criteria)
+        if nonempty & set(names):
+            # `(?<DSRUSER>.*)` samples as nothing, and `${DSRUSER != ""}` then
+            # fails the very output meant to pass it
+            try:
+                match = engine.compile_java(pattern).search(line)
+            except re.error:
+                match = None
+            for name in names:
+                if name in nonempty and name not in groups and match is not None \
+                        and not (match.group(name) or ""):
+                    groups[name] = "%s_1" % name.lower()
+            line = sample_for(pattern, groups)
         if line.strip():
             lines.append(line)
 
@@ -346,6 +367,12 @@ def _build_success(step_register, criteria, implied, counts=None, loops="all"):
     if not lines and not repeated:
         return ""
     return "\n".join(_dedupe(lines) + repeated)
+
+
+def _nonempty_names(criteria):
+    """Variables the criteria assert to be non-empty: `${X != ""}`."""
+    expr = str((criteria or {}).get("expr") or "")
+    return set(re.findall(r"([A-Za-z_][A-Za-z0-9_]*)\s*!=\s*(?:\"\"|'')", expr))
 
 
 def _specific_loop(step_register):
@@ -429,6 +456,133 @@ def _not(value):
     if text.isdigit():
         return str(int(text) + 1)
     return "NOT_MATCHING_" + text if text else "unexpected"
+
+
+# --------------------------------------------------------------------------- #
+#  REST - a response body and a status
+# --------------------------------------------------------------------------- #
+def _path_tokens(path):
+    """`$.data.items[0].name` -> ["data", "items", 0, "name"], or None."""
+    text = str(path or "").strip()
+    if not text.startswith("$") or "length()" in text:
+        return None
+    body = text[1:].lstrip(".")
+    if not body:
+        return None
+    out = []
+    for token in engine._split_path_tokens(body):
+        if not token:
+            continue
+        match = re.match(r"^([^\[]*)((?:\[\d+\])*)$", token)
+        if not match:
+            return None
+        if match.group(1):
+            out.append(match.group(1))
+        for index in re.findall(r"\[(\d+)\]", match.group(2)):
+            out.append(int(index))
+    return out or None
+
+
+def _set_path(root, tokens, value):
+    current = root
+    for i, token in enumerate(tokens):
+        last = i == len(tokens) - 1
+        nxt = None if last else tokens[i + 1]
+        container = [] if isinstance(nxt, int) else {}
+        if isinstance(token, int):
+            while len(current) <= token:
+                current.append(None)
+            if last:
+                current[token] = value
+            else:
+                if not isinstance(current[token], (dict, list)):
+                    current[token] = container
+                current = current[token]
+        else:
+            if last:
+                current[token] = value
+            else:
+                if not isinstance(current.get(token), (dict, list)):
+                    current[token] = container
+                current = current[token]
+
+
+def _build_body(rules, values, force=()):
+    """
+    A JSON body that gives each response_template rule its value.
+
+    A rule whose name has a value (from the criteria) gets it; a `required`
+    rule gets a sample; a rule with a `default` is left out, so the default is
+    what the step captures - the way a real response without that field reads.
+    A path that is a prefix of another is not set on its own: the longer path
+    builds the object it names.
+    """
+    wanted = []
+    for rule in rules or []:
+        if not isinstance(rule, dict) or not rule.get("name"):
+            continue
+        tokens = _path_tokens(rule.get("json_path"))
+        if not tokens:
+            continue
+        name = str(rule["name"])
+        if name in values:
+            wanted.append((tokens, values[name]))
+        elif rule.get("required") or "default" not in rule or name in force:
+            wanted.append((tokens, "%s_1" % name))
+    if not wanted:
+        return None
+    root = {}
+    for tokens, value in wanted:
+        if any(len(o) > len(tokens) and o[:len(tokens)] == tokens for o, _v in wanted):
+            continue
+        _set_path(root, tokens, value)
+    return root
+
+
+def _rest_passes(rules, criteria, register, body, status):
+    context = engine.Context({})
+    if engine.apply_response_template(context, rules, body):
+        return False
+    context.put("http_status", status)
+    engine.apply_registers(context, register, body)
+    return engine.eval_criteria(criteria or {}, context, body, {"http_status": status})
+
+
+def rest_outputs(rules, criteria, implied, register=None, preferred=None):
+    """
+    (success body, success status, failure body, failure status) for a REST step.
+
+    Success is the status the criteria imply (200 when they say nothing) and a
+    body carrying every value they assert. Failure flips those values and uses
+    the first status the criteria reject - trying first any status this step's
+    own on_failure handlers are gated on, so pressing Failure walks the retry
+    path the author wrote (DSR: 401 -> refresh the token -> retry).
+
+    A status of None for the failure means nothing a server could answer fails
+    this step - only a connection error can - and the page simulates that.
+    """
+    implied = dict(implied or {})
+    raw_status = str(implied.pop("http_status", "") or
+                     (criteria or {}).get("http_status") or "200")
+    ok_status = int(raw_status) if raw_status.isdigit() else 200
+    # a field the criteria read without asserting a value (`${DSRUSER != ""}`)
+    # has to be IN a passing response, default or not
+    mentioned = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*",
+                               str((criteria or {}).get("expr") or "")))
+    ok_body = _build_body(rules, implied, mentioned)
+    ok_text = dumps(ok_body) if ok_body is not None else ""
+
+    flipped = dict((name, _not(value)) for name, value in implied.items())
+    bad_body = _build_body(rules, flipped)
+    bad_text = dumps(bad_body) if bad_body is not None else ""
+    bad_status = None
+    for status in list(preferred or []) + list(_FAIL_STATUSES):
+        if status == ok_status:
+            continue
+        if not _rest_passes(rules, criteria, register, bad_text, status):
+            bad_status = status
+            break
+    return ok_text, ok_status, bad_text, bad_status
 
 
 def _exit_only(criteria):

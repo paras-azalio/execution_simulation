@@ -173,6 +173,47 @@ async function run(htmlPath, activity, mappingName, ciqPath) {
      p.document.querySelectorAll(".dbg").length > 0 ||
      !want.steps.some(s => s.render_mode === "interactive"));
 
+  /* -- the template findings lint.js reports ------------------------- */
+  const findings = JSON.parse(p.window.eval(
+    "JSON.stringify(lintWorkflow(loadWorkflow(jsyaml, " + JSON.stringify(fs.readFileSync(workflow, "utf8")) +
+    ").doc, null, {}).length)"));
+  ok("the runner shows the template findings",
+     findings === 0 || ($("lintCard") && $("lintCard").style.display !== "none"));
+
+  /* -- a saved walked copy reopens with its inputs and its walk ------- */
+  const saves = [];
+  p.window.URL.createObjectURL = (blob) => { saves.push(blob); return "blob:captured"; };
+  const firstOk = p.document.querySelector('[data-set$=":success"]');
+  let chosenUid = null;
+  if (firstOk) {
+    chosenUid = firstOk.getAttribute("data-set").split(":")[0];
+    firstOk.click();
+  }
+  if ($("btnSave")) $("btnSave").click();
+  if (ok("Save walked copy produced a file", saves.length === 1)) {
+    const text = await new Promise((resolve, reject) => {
+      const reader = new p.window.FileReader();
+      reader.onload = () => resolve(String(reader.result));
+      reader.onerror = () => reject(reader.error);
+      reader.readAsText(saves[0]);
+    });
+    const q = openRunner(text);
+    await until(() => q.document.querySelectorAll("#phases .card").length > 0,
+                "the saved copy to expand itself", 20000);
+    ok("the saved copy expands itself from the inputs it carries",
+       q.document.querySelectorAll("#phases .card").length > 0);
+    if (chosenUid) {
+      const card = q.document.getElementById("c" + chosenUid);
+      const pill = card ? card.querySelector(".pill")
+                        : (q.document.querySelector('[data-set="' + chosenUid + ':success"]') || { closest: () => null })
+                            .closest("td");
+      const label = pill && (pill.classList && pill.classList.contains("pill") ? pill : pill.querySelector(".pill"));
+      eq("and restores the walk", label && label.textContent.trim(), "SUCCESS");
+    }
+    eq("no page errors in the saved copy", q.errors.length, 0, q.errors.slice(0, 3).join("\n"));
+    q.window.close();
+  }
+
   /* -- a second node re-expands without a reload --------------------- */
   if ($("nodePick").options.length > 1) {
     $("nodePick").value = "1";
@@ -218,15 +259,15 @@ function finish(p) {
       ciq: SAMPLE_CIQ,
       mapping: "PGW_RDS_1051_SUBSCRIBER_PROFILE_CONFIGURATION_json-output.yaml",
     });
-    // The workflow whose YAML both JS parsers reject outright: it proves the
-    // page forgives what SnakeYAML forgives, rather than refusing the file.
-    const strict = path.join(HERE, "out", "all", "_ciq",
-                             "DSR_10005_SAPC_CCPC_PREFERENCE_CHANGE_IN_DSR.json");
-    if (fs.existsSync(strict)) {
+    // The REST activity: 55 rest: steps, on_failure run: handlers and a
+    // rollback phase - everything the page learned to run in 2026-09.
+    const dsr = path.join(HERE, "out", "all", "_ciq",
+                          "DSR_10006_HOST_NAME_REALM_ROUTING_CREATION_MODIFICATION_DELETION_DSR.json");
+    if (fs.existsSync(dsr)) {
       cases.push({
-        activity: "DSR_10005_SAPC_CCPC_PREFERENCE_CHANGE_IN_DSR",
-        ciq: strict,
-        mapping: "DSR_10005_SAPC_CCPC_PREFERENCE_CHANGE_IN_DSR_json-output.yaml",
+        activity: "DSR_10006_HOST_NAME_REALM_ROUTING_CREATION_MODIFICATION_DELETION_DSR",
+        ciq: dsr,
+        mapping: "DSR_10006_HOST_NAME_REALM_ROUTING_CREATION_MODIFICATION_DELETION_DSR_json-output.yaml",
       });
     }
   }
