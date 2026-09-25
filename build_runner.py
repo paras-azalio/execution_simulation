@@ -32,6 +32,9 @@ PARTS = [
     ("{{SYNTH_JS}}", os.path.join(TEMPLATE, "synth.js")),
     ("{{EXPANDER_JS}}", os.path.join(TEMPLATE, "expander.js")),
     ("{{YAMLLOAD_JS}}", os.path.join(TEMPLATE, "yamlload.js")),
+    ("{{RUNTIME_JS}}", os.path.join(TEMPLATE, "runtime.js")),
+    ("{{REPORT_JS}}", os.path.join(TEMPLATE, "report.js")),
+    ("{{LINT_JS}}", os.path.join(TEMPLATE, "lint.js")),
     ("{{UI_JS}}", os.path.join(TEMPLATE, "ui.js")),
 ]
 
