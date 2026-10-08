@@ -16,8 +16,20 @@ Ported from, and deliberately bug-compatible with:
         safeEquals()             :646-654   case SENSITIVE
         resolveForEachValue()    :281-301   a bare "${x}" resolves to the OBJECT
         findOperatorOutsideQuotes()         '>'/'<' inside quotes are literals
+        resolvePath()            :527-570   a missing key falls back to the ONE key
+                                            ending in ".<part>"; a list is indexed
+                                            by a dotted number (hosts.0)
     cliautomation/exec/ResultProcessor.java
+        captureVariables()       :16-72     the regex is INTERPOLATED, compiled
+                                            MULTILINE, the LAST match wins, no
+                                            match clears the groups to "", and a
+                                            name entry's `when` gates only itself
+        isSuccess()              :75-159    exit_code / regex / expr / http_status
+                                            / transfer_status / all[] / any[]
         register names are used verbatim, never interpolated (:68)
+    cliautomation/plugins/RestProtocolPlugin.java
+        applyInlineResponseTemplate() :591  json_path captures, default, required
+        evaluateJsonPath()       :664-775   $.a.b, $.a[0], length()
     cliautomation/exec/ExecutionOrchestrator.java
         executeLoopStep()        :573-605   continue_when runs the body when TRUE
 
@@ -38,9 +50,49 @@ PLACEHOLDER = re.compile(r"\$\{([^}]+)\}")
 # this repo use both spellings, so accept either.
 _JAVA_GROUP = re.compile(r"\(\?<([A-Za-z][A-Za-z0-9]*)>")
 
+# ResultProcessor.tryResolveGroupName(): the i-th CAPTURING group is given the
+# i-th NAME in the pattern text. An unnamed group ahead of a named one therefore
+# shifts every name by one - a real engine quirk, reproduced on purpose.
+_GROUP_NAME = re.compile(r"\(\?P?<([a-zA-Z][a-zA-Z0-9_]*)>")
+
+# java.util.regex rejects a '{' that does not open a {n}, {n,} or {n,m}
+# quantifier ("Illegal repetition"). python and JS read it as a literal, so a
+# criteria regex such as "${NEW_FILE_NAME}" - which the engine never
+# interpolates - compiles here and throws there.
+_BAD_BRACE = re.compile(r"(?<!\\)\{(?!\d+(?:,\d*)?\})")
+
+
+def java_regex_error(pattern):
+    """Why java.util.regex would refuse this pattern, or None if it compiles."""
+    text = pattern or ""
+    for name in _GROUP_NAME.findall(text):
+        if "_" in name:
+            return "group name <%s> contains '_', which java.util.regex rejects" % name
+    # (?P<name>) is python spelling and java rejects it too, but the page has
+    # always accepted it; lint.py reports it instead of the walk refusing it.
+    # a brace inside a character class is a literal to java as well
+    stripped = re.sub(r"\[(?:\\.|[^\]\\])*\]", "", text)
+    if _BAD_BRACE.search(stripped):
+        return "a '{' that is not a {n,m} quantifier (Illegal repetition)"
+    return None
+
+
+def compile_java(pattern):
+    """
+    Pattern.compile(pattern, Pattern.MULTILINE), as captureVariables() and
+    regexMatches() both call it. Raises re.error for anything java rejects.
+    """
+    reason = java_regex_error(pattern)
+    if reason:
+        raise re.error(reason)
+    return re.compile(to_java_regex(pattern), re.M)
+
 # Operators, longest first - the order the java evaluator tries them in.
 _WORD_OPS = (" notStartsWith ", " startsWith ", " notContains ", " contains ")
 _CMP_OPS = ("==", "!=", ">=", "<=", ">", "<")
+
+
+_ENVIRON = dict(os.environ)
 
 
 def to_java_regex(pattern):
@@ -66,11 +118,20 @@ class Unresolved(object):
     page can turn it into an input field.
     """
 
-    __slots__ = ("token", "reason")
+    __slots__ = ("token", "reason", "runtime")
 
-    def __init__(self, token, reason):
+    def __init__(self, token, reason, runtime=False):
         self.token = token
         self.reason = reason
+        # True when a step SETS this variable at run time - a register, a REST
+        # response field, a branch's vars - so the blank is only "not yet"
+        self.runtime = runtime
+
+    def as_dict(self):
+        out = {"token": self.token, "reason": self.reason}
+        if self.runtime:
+            out["runtime"] = True
+        return out
 
 
 class Context(object):
@@ -82,7 +143,9 @@ class Context(object):
     def __init__(self, variables=None, secrets=None, env=None):
         self.vars = dict(variables or {})
         self.secrets = dict(secrets or {})
-        self.env = dict(env if env is not None else os.environ)
+        # the synthesiser builds a throwaway Context per check; copying
+        # os.environ each time was a quarter of the walk
+        self.env = dict(env) if env is not None else _ENVIRON
         self.unresolved = []          # [Unresolved] seen since the last reset
 
     # -- scope ---------------------------------------------------------------
@@ -160,8 +223,19 @@ class Context(object):
         if part:
             if isinstance(current, dict):
                 if part not in current:
-                    return None, False
+                    # resolvePath(): a missing key falls back to the single key
+                    # that ENDS in ".<part>" - "Report.Email" answers "Email".
+                    # Two such keys and the lookup gives up.
+                    hits = [k for k in current if isinstance(k, str) and k.endswith("." + part)]
+                    if len(hits) != 1:
+                        return None, False
+                    part = hits[0]
                 current = current[part]
+            elif isinstance(current, (list, tuple)) and part.isdigit():
+                # resolvePath() indexes a list with a DOTTED number: hosts.0
+                if int(part) >= len(current):
+                    return None, False
+                current = current[int(part)]
             else:
                 return None, False
         if index is not None:
@@ -424,9 +498,26 @@ def compare_values(left, right):
     return (left > right) - (left < right)
 
 
+def interpolate_object(context, value):
+    """ExecutionContext.interpolateObject(): strings, maps and lists, recursively."""
+    if isinstance(value, str):
+        return context.interpolate(value, record_unresolved=False)
+    if isinstance(value, dict):
+        return dict((k, interpolate_object(context, v)) for k, v in value.items())
+    if isinstance(value, list):
+        return [interpolate_object(context, v) for v in value]
+    return value
+
+
+def group_names(pattern):
+    """The group names of a pattern in the order they appear in its text."""
+    return _GROUP_NAME.findall(pattern or "")
+
+
 def apply_registers(context, register, output, record=None):
     """
-    ResultProcessor: apply a step's `register` list to one command's output.
+    ResultProcessor.captureVariables(): apply a step's `register` list to one
+    command's output.
 
     Entry forms, in the order the workflow uses them:
         - name: X            value: "..."     set X (value is interpolated)
@@ -435,57 +526,287 @@ def apply_registers(context, register, output, record=None):
                                               set X_1..X_n and N=<count>
         - name: X  when: '${..}'  value: ".." conditional set
 
+    Faithful to the java, including the parts that surprise people:
+
+      * the regex is interpolated first - `IP address ${rec_row.data.IP}` works
+      * it is compiled MULTILINE, so ^ and $ are line anchors with or without
+        a leading (?m)
+      * every match is visited and the LAST one wins
+      * a regex that matches nothing clears its named groups to "" - so a value
+        from an earlier loop iteration cannot survive as if it matched
+      * in loop mode EVERY named group is numbered: X_1, Y_1, X_2, Y_2 ...
+      * a `name` entry is applied even when the same entry carries a regex, and
+        its `when` gates only the name, never the regex
+      * a name entry with no `value` sets nothing
+
     `record` collects (name, value, source) for the debug panel.
     """
-    output = output or ""
+    output = "" if output is None else output
     for entry in register or []:
         if not isinstance(entry, dict):
             continue
-        when = entry.get("when")
-        if when is not None and not context.evaluate(when):
-            if record is not None:
-                record.append((entry.get("name") or entry.get("regex"), None,
-                               "skipped: when is false"))
-            continue
 
-        if entry.get("regex"):
-            pattern = to_java_regex(entry["regex"])
+        if entry.get("regex") is not None:
+            resolved = context.interpolate(str(entry["regex"]), record_unresolved=False)
+            names = group_names(resolved)
             try:
-                compiled = re.compile(pattern)
+                compiled = compile_java(resolved)
             except re.error as exc:
                 if record is not None:
                     record.append((entry["regex"], None, "bad regex: %s" % exc))
-                continue
-            if entry.get("loop"):
-                matches = compiled.findall(output)
-                count = len(matches)
-                base = (list(compiled.groupindex) or ["MATCH"])[0]
-                for i, hit in enumerate(matches, 1):
-                    text = hit if isinstance(hit, str) else (hit[0] if hit else "")
-                    context.put("%s_%d" % (base, i), text)
-                if entry.get("count_var"):
+                compiled = None
+            if compiled is not None:
+                loop = bool(entry.get("loop"))
+                index = entry.get("start_index")
+                index = int(index) if isinstance(index, int) else 1
+                count = 0
+                for match in compiled.finditer(output):
+                    count += 1
+                    for i in range(1, compiled.groups + 1):
+                        name = names[i - 1] if i - 1 < len(names) else None
+                        if not name:
+                            continue
+                        key = "%s_%d" % (name, index) if loop else name
+                        value = match.group(i)
+                        if value is None:
+                            context.vars.pop(key, None)       # putVariable(k, null)
+                        else:
+                            context.put(key, value)
+                        if record is not None:
+                            record.append((key, value, "captured by %s" % entry["regex"]))
+                    if loop:
+                        index += 1
+                if count == 0 and not loop:
+                    for i in range(1, compiled.groups + 1):
+                        name = names[i - 1] if i - 1 < len(names) else None
+                        if name:
+                            context.put(name, "")
+                            if record is not None:
+                                record.append((name, None, "no match in output - cleared to \"\""))
+                if loop and entry.get("count_var"):
                     context.put(entry["count_var"], str(count))
                     if record is not None:
                         record.append((entry["count_var"], str(count),
                                        "loop count over %s" % entry["regex"]))
-                continue
-            match = compiled.search(output)
-            if not match:
-                if record is not None:
-                    record.append((", ".join(compiled.groupindex) or entry["regex"],
-                                   None, "no match in output"))
-                continue
-            for name in compiled.groupindex:
-                value = match.group(name) or ""
-                context.put(name, value)
-                if record is not None:
-                    record.append((name, value, "captured by %s" % entry["regex"]))
-            continue
 
         name = entry.get("name")
-        if not name:
+        if not name or not str(name).strip():
             continue
-        value = context.interpolate(entry.get("value", ""), record_unresolved=False)
+        when = entry.get("when")
+        if when is not None and not context.evaluate(when):
+            if record is not None:
+                record.append((name, None, "skipped: when is false"))
+            continue
+        if entry.get("value") is None:
+            continue
+        value = interpolate_object(context, entry.get("value"))
         context.put(name, value)
         if record is not None:
-            record.append((name, value, "set from value"))
+            record.append((name, context._stringify(value) if not isinstance(value, str)
+                           else value, "set from value"))
+
+
+# --------------------------------------------------------------------------- #
+#  criteria - ResultProcessor.isSuccess()
+# --------------------------------------------------------------------------- #
+def regex_matches(pattern, output):
+    """regexMatches(): Pattern.compile(p, MULTILINE).matcher(output).find()."""
+    if output is None:
+        return False
+    try:
+        return compile_java(str(pattern)).search(output) is not None
+    except re.error:
+        return False
+
+
+def _attr_equals(expected, actual):
+    """safeEquals(String.valueOf(expected), String.valueOf(actual))."""
+    def text(value):
+        if value is None:
+            return "null"
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        return str(value)
+    return text(expected) == text(actual)
+
+
+def matches_condition(condition, output, attrs):
+    """
+    matchesCondition() - an all[]/any[] item is NOT a nested criteria block:
+    a `regex` is matched against the output, and every other key is compared
+    to the RESULT ATTRIBUTE of that name (exit_code, http_status ...). So an
+    `expr:` inside all[] is compared to an attribute called "expr", which never
+    exists, and the item is always false.
+    """
+    if not isinstance(condition, dict) or not condition:
+        return True
+    if condition.get("regex") is not None:
+        return regex_matches(condition["regex"], output)
+    for key, expected in condition.items():
+        if not _attr_equals(expected, (attrs or {}).get(key)):
+            return False
+    return True
+
+
+def eval_criteria(criteria, context, output, attrs=None):
+    """
+    isSuccess(). `attrs` carries the protocol result attributes the java reads:
+    exit_code (ssh/local/sftp), http_status (rest), transfer_status (sftp).
+    An absent attribute fails any criterion that asks for it, as
+    intAttr(..., Integer.MIN_VALUE) does.
+    """
+    attrs = attrs or {}
+    if criteria is None:
+        code = attrs.get("exit_code")
+        return code is None or str(code) == "0"
+    if not isinstance(criteria, dict):
+        return True
+    if criteria.get("exit_code") is not None:
+        if attrs.get("exit_code") is None or str(attrs["exit_code"]) != str(criteria["exit_code"]):
+            return False
+    if criteria.get("regex") is not None and not regex_matches(criteria["regex"], output):
+        return False
+    expr = criteria.get("expr")
+    if isinstance(expr, str) and expr.strip() and not context.evaluate(expr):
+        return False
+    if criteria.get("http_status") is not None:
+        if attrs.get("http_status") is None or str(attrs["http_status"]) != str(criteria["http_status"]):
+            return False
+    if criteria.get("transfer_status") is not None:
+        if not _attr_equals(criteria["transfer_status"], attrs.get("transfer_status")):
+            return False
+    if isinstance(criteria.get("all"), list) and criteria["all"]:
+        if not all(matches_condition(c, output, attrs) for c in criteria["all"]):
+            return False
+    if isinstance(criteria.get("any"), list) and criteria["any"]:
+        if not any(matches_condition(c, output, attrs) for c in criteria["any"]):
+            return False
+    return True
+
+
+# --------------------------------------------------------------------------- #
+#  REST - RestProtocolPlugin
+# --------------------------------------------------------------------------- #
+def parse_body(body):
+    """
+    The response body as the plugin reads it: `\\/` unescaped, then loaded.
+    Returns (root, error). An empty body loads as nothing, which is not an
+    error - every json_path then resolves to its default.
+    """
+    text = (body or "").replace("\\/", "/")
+    if not text.strip():
+        return None, None
+    try:
+        return json.loads(text), None
+    except ValueError:
+        pass
+    try:
+        import yaml                                       # SnakeYAML reads more than JSON
+        return yaml.safe_load(text), None
+    except Exception as exc:                              # noqa: BLE001
+        return None, "failed to parse response body for inline response_template: %s" % exc
+
+
+def _split_path_tokens(body):
+    tokens, buf, depth = [], [], 0
+    for char in body:
+        if char == "." and depth == 0:
+            tokens.append("".join(buf))
+            buf = []
+            continue
+        if char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+        buf.append(char)
+    if buf:
+        tokens.append("".join(buf))
+    return tokens
+
+
+def _navigate(current, token):
+    at = token.find("[")
+    key = token if at < 0 else token[:at]
+    pos = 0
+    if key:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+        pos = len(key)
+    while pos < len(token):
+        if token[pos] != "[":
+            return None
+        close = token.find("]", pos)
+        if close < 0:
+            return None
+        raw = token[pos + 1:close].strip()
+        if not re.match(r"^-?\d+$", raw) or not isinstance(current, list):
+            return None
+        index = int(raw)
+        if index < 0 or index >= len(current):
+            return None
+        current = current[index]
+        pos = close + 1
+    return current
+
+
+def json_path(root, path):
+    """evaluateJsonPath(): $, $.a.b, $.a[0].b, $.list.length() - nothing more."""
+    if root is None or path is None:
+        return None
+    path = str(path).strip()
+    if not path:
+        return None
+    if path == "$":
+        return root
+    if not path.startswith("$"):
+        return None
+    body = path[1:]
+    if body.startswith("."):
+        body = body[1:]
+    current = root
+    for token in _split_path_tokens(body):
+        if not token:
+            continue
+        if token == "length()":
+            if isinstance(current, (list, dict, str)):
+                current = len(current)
+                continue
+            return None
+        current = _navigate(current, token)
+        if current is None:
+            return None
+    return current
+
+
+def apply_response_template(context, rules, body, record=None):
+    """
+    applyInlineResponseTemplate(). Returns an error string when a `required`
+    field is missing or the body cannot be read - the plugin throws there, and
+    the step fails with that message - otherwise None.
+    """
+    if not isinstance(rules, list):
+        return None
+    root, error = parse_body(body)
+    if error:
+        return error
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        name = context.interpolate(str(rule.get("name") or ""), record_unresolved=False)
+        if not name.strip():
+            continue
+        path = context.interpolate(str(rule.get("json_path") or ""), record_unresolved=False)
+        value = json_path(root, path)
+        source = "json_path %s" % path
+        if value is None and "default" in rule:
+            value = interpolate_object(context, rule.get("default"))
+            source = "default (nothing at %s)" % path
+        if value is None and rule.get("required"):
+            return "required response_template field missing: %s path=%s" % (name, path)
+        if value is not None:
+            context.put(name, value)
+        if record is not None:
+            record.append((name, None if value is None else context._stringify(value)
+                           if not isinstance(value, str) else value, source))
+    return None

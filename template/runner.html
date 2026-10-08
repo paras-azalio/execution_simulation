@@ -62,6 +62,10 @@
 </div>
 
 <script>
+/* The page as delivered - "Save walked copy" writes it back out with the
+   three inputs and the walk baked in. */
+const PRISTINE = "<!DOCTYPE html>\n" + document.documentElement.outerHTML;
+
 /* ===================================================================== *
  *  js-yaml (vendored, unmodified) - the page has to read a workflow, and
  *  it has to work opened from disk with no network.
@@ -80,6 +84,12 @@
 {{EXPANDER_JS}}
 
 {{YAMLLOAD_JS}}
+
+{{RUNTIME_JS}}
+
+{{REPORT_JS}}
+
+{{LINT_JS}}
 
 {{UI_JS}}
 
@@ -203,7 +213,8 @@
 
     const index = parseInt($("nodePick").value || "0", 10);
     const node = nodes[index];
-    const params = Object.assign({}, DEFAULT_PARAMS);
+    // NODE_TYPE, SUB_ACTIVITY_NAME and INPUT_JSON_FILE_NAME follow the activity
+    const params = Object.assign({}, DEFAULT_PARAMS, activityParams(name.workflow, data, name.ciq));
     let expansion;
     try {
       expansion = new Expander(workflow, data, params, mapping).expand(node);
@@ -226,14 +237,29 @@
       steps: expansion.steps.length,
     });
 
+    let findings = [];
+    try {
+      findings = lintWorkflow(workflow, data, params, duplicateKeys(text.workflow));
+    } catch (e) {
+      say("note", "lint could not run: " + (e.message || e));
+      paintNotes();
+    }
+
+    const expander = new Expander(workflow, data, params, mapping);
     document.getElementById("app").innerHTML = "";
     initDocument({
       mount: document.getElementById("app"),
       meta: meta,
       steps: expansion.steps,
-      vars: expansion.vars,
-      globals: new Expander(workflow, data, params, mapping).globalsVars(),
+      phases: expansion.phases,
+      loops: expansion.loops,
+      vars: expander.baseContext(node),
+      globals: expander.globalsVars(),
       params: params,
+      lint: findings,
+      pristine: PRISTINE,
+      seed: seedFor(index),
+      seedExtra: () => ({ inputs: { text: text, name: name }, node: index }),
       storageKey: "execflow:runner:" + (meta.activity || name.workflow) + ":" + meta.node,
     });
     document.getElementById("app").scrollIntoView({ behavior: "smooth", block: "start" });
@@ -272,6 +298,23 @@
       if (el) el.classList.toggle("hidden");
     };
   });
+
+  /* A saved walked copy carries its three inputs and the walk: load them
+     and expand straight away, so it opens exactly as it was saved. */
+  const SEED = readSeed();
+  function seedFor(index) {
+    return SEED && SEED.node === index ? SEED : null;
+  }
+  if (SEED && SEED.inputs) {
+    for (const slot of ["workflow", "ciq", "mapping"]) {
+      text[slot] = (SEED.inputs.text || {})[slot] || "";
+      name[slot] = (SEED.inputs.name || {})[slot] || "";
+    }
+    if (text.ciq) loadCiq();
+    if (typeof SEED.node === "number" && nodes[SEED.node]) $("nodePick").value = String(SEED.node);
+    paintNames();
+    if (text.workflow && text.ciq && nodes.length) expand();
+  }
 
   paintNames();
 })();

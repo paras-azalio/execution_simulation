@@ -126,6 +126,53 @@ const F = (label, got) => eq(label, got, false);
                     { regex: "(?m)^BLOCKED=(?<BLOCKED>.+)" }],
                    "NEEDUPDATE=yes", vars);
   eq("no match keeps the declared default", vars.BLOCKED, "");
+
+  vars = { X: "stale" };
+  E.applyRegisters([{ regex: "^X=(?<X>.+)" }], "nothing", vars);
+  eq("no match clears the group to \"\" (captureVariables)", vars.X, "");
+
+  vars = {};
+  E.applyRegisters([{ regex: "^line (?<N>\\d)$" }], "line 1\nline 2", vars);
+  eq("MULTILINE without (?m), and the LAST match wins", vars.N, "2");
+
+  vars = { IP: "10.0.0.7" };
+  E.applyRegisters([{ regex: "(?<HIT>address ${IP})" }], "address 10.0.0.7 up", vars);
+  eq("a register regex is interpolated first", vars.HIT, "address 10.0.0.7");
+
+  vars = {};
+  E.applyRegisters([{ regex: "(?m)^(?<K>\\w+)=(?<V>\\w+)$", loop: true, count_var: "C" }],
+                   "a=1\nb=2", vars);
+  eq("a loop register numbers every group", [vars.K_1, vars.V_1, vars.K_2, vars.V_2, vars.C],
+     ["a", "1", "b", "2", "2"]);
+
+  vars = { GATE: "no" };
+  E.applyRegisters([{ regex: "(?<R>ok)", name: "N", when: '${GATE == "yes"}', value: "v" }], "ok", vars);
+  eq("a name entry's when gates only the name, not the regex", [vars.R, vars.N], ["ok", undefined]);
+
+  vars = {};
+  E.applyRegisters([{ name: "NOVALUE" }], "", vars);
+  eq("a name entry without a value sets nothing", "NOVALUE" in vars, false);
+
+  vars = {};
+  E.applyRegisters([{ regex: "(x)(?<NAME>y)" }], "xy", vars);
+  eq("an unnamed group ahead shifts the names (tryResolveGroupName)", vars.NAME, "x");
+}
+
+/* -- REST -------------------------------------------------------------- */
+{
+  const vars = {};
+  const err = E.applyResponseTemplate(
+    [{ name: "TOKEN", json_path: "$.data.token", required: true },
+     { name: "N", json_path: "$.items.length()" },
+     { name: "FIRST", json_path: "$.items[0].id" },
+     { name: "GONE", json_path: "$.nope", default: "d" }],
+    '{"data":{"token":"t\\/1"},"items":[{"id":"a"},{"id":"b"}]}', vars);
+  eq("response_template reads json paths", [err, vars.TOKEN, vars.N, vars.FIRST, vars.GONE],
+     [null, "t/1", 2, "a", "d"]);
+  const miss = E.applyResponseTemplate([{ name: "T", json_path: "$.t", required: true }], "{}", {});
+  T("a missing required field is an error", /required response_template field missing/.test(miss));
+  eq("suffix key lookup (resolvePath)", E.resolveName("row.Email", { row: { "Report.Email": "e" } }), "e");
+  eq("dotted list index (resolvePath)", E.resolveName("hosts.1", { hosts: ["a", "b"] }), "b");
 }
 
 /* -- criteria ------------------------------------------------------------ */
@@ -136,8 +183,18 @@ const F = (label, got) => eq(label, got, false);
   T("regex against the output",
     E.evalCriteria({ regex: "(?m)^ok$" }, {}, "ok", 0));
   F("regex that does not match", E.evalCriteria({ regex: "^ok$" }, {}, "no", 0));
-  T("all[]", E.evalCriteria({ all: [{ expr: "${A == B}" }, { exit_code: 0 }] },
-                            { A: "1", B: "1" }, "", 0));
+  T("all[] of a regex and an attribute",
+    E.evalCriteria({ all: [{ regex: "ok" }, { exit_code: 0 }] }, {}, "all ok", 0));
+  F("an expr inside all[] is compared as an attribute and is always false (matchesCondition)",
+    E.evalCriteria({ all: [{ expr: "${A == B}" }, { exit_code: 0 }] }, { A: "1", B: "1" }, "", 0));
+  T("http_status is compared, not assumed",
+    E.evalCriteria({ http_status: 200 }, {}, "", { http_status: 200 }));
+  F("a different http_status fails", E.evalCriteria({ http_status: 200 }, {}, "", { http_status: 401 }));
+  F("exit_code against a result that has none fails (a REST step)",
+    E.evalCriteria({ exit_code: 0 }, {}, "", { http_status: 200 }));
+  T("criteria regex is MULTILINE", E.evalCriteria({ regex: "^ok$" }, {}, "x\nok\ny", 0));
+  F("a criteria regex with ${...} is refused the way java refuses it",
+    E.evalCriteria({ regex: "${NEW_FILE_NAME}" }, { NEW_FILE_NAME: "a" }, "${NEW_FILE_NAME}", 0));
   F("all[] with one false",
     E.evalCriteria({ all: [{ expr: '${A == "2"}' }, { exit_code: 0 }] },
                    { A: "1" }, "", 0));

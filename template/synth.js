@@ -222,8 +222,7 @@ function synthPasses(register, criteria, output) {
   if (typeof expr === "string" && expr.trim() && !evalCond(expr, vars)) return false;
   const pattern = (criteria || {}).regex;
   if (typeof pattern === "string" && pattern.trim()) {
-    const re = compileRe(pattern, "");
-    if (re && !re.test(output || "")) return false;
+    if (!regexMatches(pattern, output || "")) return false;
   }
   return true;
 }
@@ -290,7 +289,21 @@ function buildSuccess(register, criteria, implied, counts, loops) {
     for (const name of names) {
       if (Object.prototype.hasOwnProperty.call(implied, name)) groups[name] = implied[name];
     }
-    const line = sampleFor(pattern, groups);
+    let line = sampleFor(pattern, groups);
+    const nonempty = nonemptyNames(criteria);
+    if (names.some(n => nonempty.has(n))) {
+      // `(?<DSRUSER>.*)` samples as nothing, and `${DSRUSER != ""}` then
+      // fails the very output meant to pass it
+      const re = compileJava(pattern);
+      const m = re ? re.exec(line) : null;
+      for (const name of names) {
+        if (nonempty.has(name) && !Object.prototype.hasOwnProperty.call(groups, name) && m &&
+            !((m.groups || {})[name] || "")) {
+          groups[name] = name.toLowerCase() + "_1";
+        }
+      }
+      line = sampleFor(pattern, groups);
+    }
     if (line.trim()) lines.push(line);
   }
 
@@ -303,6 +316,16 @@ function buildSuccess(register, criteria, implied, counts, loops) {
   // output satisfies it; inventing node output would only mislead.
   if (!lines.length && !repeated.length) return "";
   return dedupe(lines).concat(repeated).join("\n");
+}
+
+/** Variables the criteria assert to be non-empty: `${X != ""}`. */
+function nonemptyNames(criteria) {
+  const expr = String(((criteria || {}).expr) || "");
+  const out = new Set();
+  const re = /([A-Za-z_][A-Za-z0-9_]*)\s*!=\s*(?:""|'')/g;
+  let m;
+  while ((m = re.exec(expr))) out.add(m[1]);
+  return out;
 }
 
 /** The words a passing command prints, verified against the criteria. */
@@ -358,7 +381,106 @@ function failureOutput(register, criteria, implied) {
   return output;
 }
 
+/* ------------------------------------------------------------------ *
+ *  REST - a response body and a status (synth.rest_outputs)
+ * ------------------------------------------------------------------ */
+const FAIL_STATUSES = [500, 404, 401, 400, 503];
+
+/** `$.data.items[0].name` -> ["data", "items", 0, "name"], or null. */
+function pathTokens(path) {
+  const text = String(path === undefined || path === null ? "" : path).trim();
+  if (!text.startsWith("$") || text.indexOf("length()") >= 0) return null;
+  const body = text.slice(1).replace(/^\.+/, "");
+  if (!body) return null;
+  const out = [];
+  for (const token of splitPathTokens(body)) {
+    if (!token) continue;
+    const m = /^([^\[]*)((?:\[\d+\])*)$/.exec(token);
+    if (!m) return null;
+    if (m[1]) out.push(m[1]);
+    const re = /\[(\d+)\]/g;
+    let i;
+    while ((i = re.exec(m[2]))) out.push(parseInt(i[1], 10));
+  }
+  return out.length ? out : null;
+}
+
+function setPath(root, tokens, value) {
+  let cur = root;
+  tokens.forEach((token, i) => {
+    const last = i === tokens.length - 1;
+    const container = typeof tokens[i + 1] === "number" ? [] : {};
+    if (typeof token === "number") {
+      while (cur.length <= token) cur.push(null);
+      if (last) cur[token] = value;
+      else {
+        if (!cur[token] || typeof cur[token] !== "object") cur[token] = container;
+        cur = cur[token];
+      }
+    } else {
+      if (last) cur[token] = value;
+      else {
+        if (!cur[token] || typeof cur[token] !== "object") cur[token] = container;
+        cur = cur[token];
+      }
+    }
+  });
+}
+
+function buildBody(rules, values, force) {
+  force = force || new Set();
+  const wanted = [];
+  for (const rule of rules || []) {
+    if (!rule || typeof rule !== "object" || !rule.name) continue;
+    const tokens = pathTokens(rule.json_path);
+    if (!tokens) continue;
+    const name = String(rule.name);
+    if (Object.prototype.hasOwnProperty.call(values, name)) wanted.push([tokens, values[name]]);
+    else if (rule.required || !("default" in rule) || force.has(name)) wanted.push([tokens, name + "_1"]);
+  }
+  if (!wanted.length) return null;
+  const root = {};
+  const same = (a, b) => a.length === b.length && a.every((t, i) => t === b[i]);
+  for (const [tokens, value] of wanted) {
+    if (wanted.some(([o]) => o.length > tokens.length && same(o.slice(0, tokens.length), tokens))) continue;
+    setPath(root, tokens, value);
+  }
+  return root;
+}
+
+function restPasses(rules, criteria, register, body, status) {
+  const vars = {};
+  if (applyResponseTemplate(rules, body, vars)) return false;
+  vars.http_status = status;
+  applyRegisters(register, body, vars);
+  return evalCriteria(criteria || {}, vars, body, { http_status: status });
+}
+
+/** [success body, success status, failure body, failure status]; a failure
+ *  status of null means only a connection error can fail this step. */
+function restOutputs(rules, criteria, implied, register, preferred) {
+  implied = Object.assign({}, implied || {});
+  const rawStatus = String(implied.http_status || ((criteria || {}).http_status) || "200");
+  delete implied.http_status;
+  const okStatus = /^\d+$/.test(rawStatus) ? parseInt(rawStatus, 10) : 200;
+  // a field the criteria read without asserting a value has to be IN a
+  // passing response, default or not
+  const mentioned = new Set(String(((criteria || {}).expr) || "").match(/[A-Za-z_][A-Za-z0-9_]*/g) || []);
+  const okBody = buildBody(rules, implied, mentioned);
+  const okText = okBody !== null ? pyDumps(okBody) : "";
+  const flipped = {};
+  for (const name of Object.keys(implied)) flipped[name] = notValue(implied[name]);
+  const badBody = buildBody(rules, flipped);
+  const badText = badBody !== null ? pyDumps(badBody) : "";
+  let badStatus = null;
+  for (const status of (preferred || []).concat(FAIL_STATUSES)) {
+    if (status === okStatus) continue;
+    if (!restPasses(rules, criteria, register, badText, status)) { badStatus = status; break; }
+  }
+  return [okText, okStatus, badText, badStatus];
+}
+
 if (typeof module !== "undefined" && module.exports) {
   module.exports = { sampleFor, successOutput, failureOutput, groupNames,
-                     criteriaRegexes, specificLoop, notValue, SYNTH_MARKER };
+                     criteriaRegexes, specificLoop, notValue, SYNTH_MARKER, restOutputs };
 }

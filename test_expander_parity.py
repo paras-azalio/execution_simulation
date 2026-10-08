@@ -34,6 +34,7 @@ sys.path.insert(0, HERE)
 import ciq as CIQ                                          # noqa: E402
 import ciqgen                                              # noqa: E402
 import runall                                              # noqa: E402
+import lint as LINT                                        # noqa: E402
 from expander import Expander                              # noqa: E402
 
 EXPAND_JS = os.path.join(HERE, "expand_js.js")
@@ -41,11 +42,21 @@ EXPAND_JS = os.path.join(HERE, "expand_js.js")
 # The fields that decide what the operator is shown and what the page then
 # does with a click. `produces` and `validation.description` are left out: they
 # are debug detail, not document content.
-COMPARED = ["uid", "seq", "phase", "phase_name", "render_mode", "kind",
-            "node_ref", "node_target", "description", "send", "when",
+COMPARED = ["uid", "step_id", "seq", "phase", "phase_name", "render_mode", "kind",
+            "node_ref", "node_target", "description", "send", "send_raw", "when",
             "when_state", "skip_when", "skip_state", "success_output",
-            "failure_output", "implied", "consumes", "on_failure", "register",
-            "retries", "timeout_sec", "hide_when_skipped", "use_exit_code"]
+            "success_status", "failure_output", "failure_status", "failure_exit",
+            "implied", "consumes", "on_failure", "register", "rest", "sftp",
+            "retries", "timeout_sec", "hide_when_skipped", "use_exit_code",
+            "ignore_exit", "validation"]
+
+# The tables the page runs the document with: a phase's gate, on_failure and
+# then:, and every loop instance's items and gates.
+PHASE_FIELDS = ["key", "id", "name", "when", "when_state", "on_failure", "then",
+                "post_failure", "render_mode", "steps"]
+LOOP_FIELDS = ["uid", "step_id", "phase", "var", "items", "count", "when",
+               "skip_when", "continue_when", "break_when", "max_iterations",
+               "overflow", "on_failure", "depth", "parent"]
 
 
 def _norm(value):
@@ -82,7 +93,8 @@ def python_expansion(workflow, data, template, params, node):
         payload["descriptionRaw"] = payload.pop("description_raw", "")
         payload.pop("step_description", None)
         steps.append(payload)
-    return {"steps": steps, "warnings": expansion.warnings}
+    return {"steps": steps, "warnings": expansion.warnings,
+            "phases": expansion.phases, "loops": expansion.loops}
 
 
 def js_expansion(yaml_path, ciq_path, mapping, node_index, params):
@@ -113,6 +125,9 @@ def compare(name, yaml_path, mapping, ciq_path, node_index=0):
 
     py = python_expansion(workflow, data, template, params, nodes[node_index])
     js = js_expansion(yaml_path, ciq_path, mapping, node_index, params)
+    # the same findings for a file dropped into the runner (duplicate keys
+    # come from each side's own loader and are not compared)
+    py_lint = [f.as_dict() for f in LINT.lint(workflow, data, params)]
 
     problems = []
     if len(py["steps"]) != len(js["steps"]):
@@ -135,6 +150,34 @@ def compare(name, yaml_path, mapping, ciq_path, node_index=0):
     if sorted(py["warnings"]) != sorted(js["warnings"]):
         problems.append("%s: warnings\n    python: %r\n    browser: %r"
                         % (name, sorted(py["warnings"]), sorted(js["warnings"])))
+    if len(py["phases"]) != len(js.get("phases") or []):
+        problems.append("%s: %d phases in python, %d in the browser"
+                        % (name, len(py["phases"]), len(js.get("phases") or [])))
+    for a, b in zip(py["phases"], js.get("phases") or []):
+        for field in PHASE_FIELDS:
+            if _norm(a.get(field)) != _norm(b.get(field)):
+                problems.append("%s phase %s: %s\n    python: %r\n    browser: %r"
+                                % (name, a.get("key"), field, a.get(field), b.get(field)))
+    js_lint = js.get("lint") or []
+    if py_lint != js_lint:
+        first = next((i for i, (a, b) in enumerate(zip(py_lint, js_lint)) if a != b),
+                     min(len(py_lint), len(js_lint)))
+        problems.append("%s: lint findings differ (%d python, %d browser), first at %d\n"
+                        "    python: %r\n    browser: %r"
+                        % (name, len(py_lint), len(js_lint), first,
+                           py_lint[first] if first < len(py_lint) else None,
+                           js_lint[first] if first < len(js_lint) else None))
+    py_loops, js_loops = py["loops"], js.get("loops") or {}
+    if sorted(py_loops) != sorted(js_loops):
+        problems.append("%s: loop instances differ\n    python: %d\n    browser: %d"
+                        % (name, len(py_loops), len(js_loops)))
+    else:
+        for uid in sorted(py_loops):
+            for field in LOOP_FIELDS:
+                if _norm(py_loops[uid].get(field)) != _norm(js_loops[uid].get(field)):
+                    problems.append("%s loop %s: %s\n    python: %r\n    browser: %r"
+                                    % (name, uid, field, py_loops[uid].get(field),
+                                       js_loops[uid].get(field)))
     return problems
 
 

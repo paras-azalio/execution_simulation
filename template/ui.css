@@ -115,5 +115,31 @@ ul.checks li .k{font-family:inherit}
 .err{border-left:3px solid var(--bad);background:var(--badbg);color:var(--bad);
   padding:8px 10px;border-radius:0 6px 6px 0;font-size:12.5px;margin-top:8px;
   white-space:pre-wrap}
+/* -- the run: warnings, routing, rollback -------------------------------- */
+.step.s-warning{border-left:4px solid var(--warn)}
+.step.hid,tr.hid{display:none}
+.cmdbox{padding:0 12px 8px}
+.cmdbox pre.body{margin-top:4px;opacity:.9}
+.kind{display:inline-block;font-size:10px;font-weight:700;letter-spacing:.04em;padding:0 5px;
+  border-radius:3px;background:var(--idlebg);color:var(--idle)}
+.step .note{margin:0 12px 6px;border-left:3px solid var(--line);background:transparent;
+  color:var(--muted);padding:2px 8px;border-radius:0}
+.step.s-failure .note,.step.s-warning .note{border-left-color:var(--warn)}
+ul.routes{margin:0 12px 8px;padding:6px 10px 6px 26px;background:var(--idlebg);border-radius:6px;
+  font-size:12px;color:var(--ink)}
+ul.routes li{margin:1px 0}
+.banner{border-radius:7px;padding:8px 12px;margin-bottom:8px;font-size:13px;border:1px solid var(--line)}
+.banner.bad{background:var(--badbg);color:var(--bad);border-color:transparent}
+.banner.warn{background:var(--warnbg);color:var(--warn);border-color:transparent}
+.banner.idle{background:var(--panel);color:var(--muted)}
+.card.gated>h2{opacity:.65}
+button.chip{padding:2px 7px;font-size:11px}
+ul.lint{margin:0;padding-left:18px}
+ul.lint li{font-size:12.5px;margin:3px 0}
+ul.lint li.error b{color:var(--bad)}
+ul.lint li.warning b{color:var(--warn)}
+ul.lint li.info b{color:var(--idle)}
+@media (max-width:640px){.sh{flex-wrap:wrap}.seq{min-width:0}.toolbar .grow{display:none}}
+
 @media print{.btns,.toolbar,button,.drop,#loader{display:none}.sbody{display:block}
   body{background:#fff}}
